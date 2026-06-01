@@ -214,7 +214,12 @@ class OpenAIClient(BaseLLMClient):
             llm_kwargs["base_url"] = self.base_url or _resolve_provider_base_url(self.provider)
             api_key_env = get_api_key_env(self.provider)
             if api_key_env:
-                api_key = os.environ.get(api_key_env)
+                # An explicitly supplied api_key kwarg takes precedence over the
+                # environment variable: api_key is a documented passthrough kwarg,
+                # so a programmatic caller passing it must not be forced to also
+                # export the env var (the passthrough loop below runs too late,
+                # after this branch may have already raised).
+                api_key = self.kwargs.get("api_key") or os.environ.get(api_key_env)
                 if api_key:
                     llm_kwargs["api_key"] = api_key
                 else:

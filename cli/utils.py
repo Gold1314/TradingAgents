@@ -471,7 +471,7 @@ def ask_minimax_region() -> tuple[str, str]:
 
 
 def confirm_ollama_endpoint(url: str) -> None:
-    """Show the resolved Ollama endpoint after provider selection.
+    r"""Show the resolved Ollama endpoint after provider selection.
 
     Surfaces three things the user benefits from seeing before model
     selection: which URL we'll actually hit, where it came from
