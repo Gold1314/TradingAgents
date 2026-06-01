@@ -5,7 +5,6 @@
     "dockerfilePath": "Dockerfile.web"
   },
   "deploy": {
-    "startCommand": "python -m uvicorn web.server:app --host 0.0.0.0 --port $PORT",
     "healthcheckPath": "/api/config",
     "healthcheckTimeout": 300,
     "numReplicas": 1,
