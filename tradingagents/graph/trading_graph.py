@@ -32,6 +32,7 @@ from tradingagents.agents.utils.agent_utils import (
     resolve_instrument_identity,
     get_stock_data,
     get_indicators,
+    get_verified_market_snapshot,
     get_fundamentals,
     get_balance_sheet,
     get_cashflow,
@@ -173,6 +174,10 @@ class TradingAgentsGraph:
                     get_stock_data,
                     # Technical indicators
                     get_indicators,
+                    # Deterministic ground-truth snapshot the market analyst is
+                    # instructed to call before writing its report. Must be
+                    # registered here or the bound tool call fails at runtime.
+                    get_verified_market_snapshot,
                 ]
             ),
             "social": ToolNode(
