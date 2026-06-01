@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StockAgents — AI investment desk</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+  <script>tailwind.config = { darkMode: "class" };</script>
+  <style>
+    :root { color-scheme: dark; }
+    body { background: radial-gradient(1200px 600px at 80% -10%, #15213a 0%, #0b1120 45%, #070b16 100%); }
+    @keyframes shimmer { 0%{background-position:-400px 0} 100%{background-position:400px 0} }
+    .shimmer { background:linear-gradient(90deg,#1e293b 0%,#334155 50%,#1e293b 100%); background-size:800px 100%; animation:shimmer 1.4s infinite linear; }
+    @keyframes pulse-dot { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.35;transform:scale(.7)} }
+    .pulse-dot { animation:pulse-dot 1s infinite; }
+    @keyframes slide-in { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+    .slide-in { animation:slide-in .35s ease both; }
+    .feed-md{line-height:1.6;}
+    .feed-md h1,.feed-md h2,.feed-md h3{font-weight:600;margin:.8em 0 .35em;color:#f1f5f9;}
+    .feed-md h1{font-size:1.05rem;} .feed-md h2{font-size:.98rem;} .feed-md h3{font-size:.9rem;color:#cbd5e1;}
+    .feed-md p{margin:.5em 0;} .feed-md ul,.feed-md ol{margin:.5em 0 .5em 1.25em;list-style:disc;}
+    .feed-md ol{list-style:decimal;} .feed-md li{margin:.2em 0;}
+    .feed-md table{border-collapse:collapse;margin:.6em 0;font-size:.8rem;width:100%;}
+    .feed-md th,.feed-md td{border:1px solid #334155;padding:.3em .55em;text-align:left;}
+    .feed-md th{background:#1e293b;} .feed-md code{background:#0f172a;padding:.12em .35em;border-radius:.3em;font-size:.82rem;color:#fbbf24;}
+    .feed-md strong{color:#e2e8f0;font-weight:600;} .feed-md a{color:#60a5fa;text-decoration:underline;}
+    .feed-md blockquote{border-left:3px solid #475569;padding-left:.8em;color:#94a3b8;margin:.5em 0;}
+    .scroll-body{max-height:340px;overflow:auto;} .scroll-body::-webkit-scrollbar{width:8px;} .scroll-body::-webkit-scrollbar-thumb{background:#334155;border-radius:8px;}
+  </style>
+</head>
+<body class="text-slate-200 min-h-screen">
+<div class="max-w-6xl mx-auto px-4 py-6">
+
+  <!-- ░░ Header ░░ -->
+  <header class="flex items-center justify-between mb-6">
+    <div class="flex items-center gap-3">
+      <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-400 to-sky-500 flex items-center justify-center shadow-lg shadow-emerald-500/20">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#0b1120" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l5-5 4 4 8-9"/><path d="M21 7v5h-5"/></svg>
+      </div>
+      <div>
+        <h1 class="text-xl font-bold text-white tracking-tight">Stock<span class="text-emerald-400">Agents</span></h1>
+        <p class="text-xs text-slate-400 -mt-0.5">Bulls argue. Bears push back. Your AI desk delivers the verdict — in real time.</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-3">
+      <div id="timer" class="hidden text-sm font-mono text-slate-400 tabular-nums">0.0s</div>
+      <div id="status-pill" class="text-xs px-3 py-1.5 rounded-full bg-slate-800/80 text-slate-400 border border-slate-700">idle</div>
+      <button id="admin-btn" title="Admin settings" class="w-9 h-9 rounded-lg border border-slate-700 bg-slate-900/60 hover:border-slate-500 text-slate-400 hover:text-slate-200 transition flex items-center justify-center">⚙</button>
+    </div>
+  </header>
+
+  <!-- ░░ Input form ░░ -->
+  <form id="run-form" class="bg-slate-900/70 backdrop-blur border border-slate-800 rounded-2xl p-5 mb-6 shadow-xl shadow-black/20">
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div>
+        <label class="block text-xs font-medium text-slate-400 mb-1.5">Ticker</label>
+        <input id="ticker" value="NVDA" class="w-full bg-slate-950/60 border border-slate-700 rounded-lg px-3 py-2.5 text-sm font-semibold tracking-wide uppercase focus:outline-none focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400/40" />
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-400 mb-1.5">Trade date</label>
+        <input id="trade_date" type="date" class="w-full bg-slate-950/60 border border-slate-700 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400/40" />
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-400 mb-1.5">Asset type</label>
+        <select id="asset_type" class="w-full bg-slate-950/60 border border-slate-700 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-emerald-400">
+          <option value="stock">Stock</option><option value="crypto">Crypto</option><option value="forex">Forex</option><option value="commodity">Commodity</option>
+        </select>
+      </div>
+      <div class="flex items-end">
+        <button id="run-btn" type="submit" class="w-full bg-gradient-to-r from-emerald-500 to-sky-500 hover:from-emerald-400 hover:to-sky-400 text-slate-950 font-bold rounded-lg px-4 py-2.5 text-sm transition shadow-lg shadow-emerald-500/20 disabled:opacity-50 disabled:cursor-not-allowed">Run analysis</button>
+      </div>
+    </div>
+    <div class="mt-4">
+      <label class="block text-xs font-medium text-slate-400 mb-1.5">Analyst team</label>
+      <div id="analysts" class="flex flex-wrap gap-2 text-sm"></div>
+    </div>
+    <details class="mt-4 text-sm">
+      <summary class="cursor-pointer text-slate-500 hover:text-slate-300 text-xs">Advanced — models &amp; debate rounds</summary>
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mt-3">
+        <div><label class="block text-xs text-slate-500 mb-1">Provider</label><input id="provider" class="w-full bg-slate-950/60 border border-slate-700 rounded-lg px-3 py-2 text-sm" /></div>
+        <div><label class="block text-xs text-slate-500 mb-1">Deep model</label><input id="deep_model" class="w-full bg-slate-950/60 border border-slate-700 rounded-lg px-3 py-2 text-sm" /></div>
+        <div><label class="block text-xs text-slate-500 mb-1">Quick model</label><input id="quick_model" class="w-full bg-slate-950/60 border border-slate-700 rounded-lg px-3 py-2 text-sm" /></div>
+        <div class="grid grid-cols-2 gap-2">
+          <div><label class="block text-xs text-slate-500 mb-1">Debate</label><input id="max_debate_rounds" type="number" min="1" class="w-full bg-slate-950/60 border border-slate-700 rounded-lg px-3 py-2 text-sm" /></div>
+          <div><label class="block text-xs text-slate-500 mb-1">Risk</label><input id="max_risk_rounds" type="number" min="1" class="w-full bg-slate-950/60 border border-slate-700 rounded-lg px-3 py-2 text-sm" /></div>
+        </div>
+      </div>
+    </details>
+  </form>
+
+  <!-- ░░ Compact run summary (after start) ░░ -->
+  <div id="run-summary" class="hidden items-center justify-between bg-slate-900/70 border border-slate-800 rounded-xl px-4 py-3 mb-6">
+    <div id="run-summary-text" class="text-sm text-slate-300 font-medium"></div>
+    <button id="new-run" class="text-xs px-3 py-1.5 rounded-lg border border-slate-700 hover:border-emerald-400 hover:text-emerald-300 transition">＋ New analysis</button>
+  </div>
+
+  <!-- ░░ Cache banner ░░ -->
+  <div id="cache-banner" class="hidden items-center justify-between gap-4 bg-sky-500/10 border border-sky-500/40 text-sky-200 rounded-xl px-4 py-3 mb-6">
+    <div class="text-sm flex items-center gap-2"><span>🕑</span><span id="cache-banner-text"></span></div>
+    <button id="run-fresh" class="text-xs px-3 py-1.5 rounded-lg border border-sky-400/60 hover:bg-sky-400/20 transition whitespace-nowrap">Run fresh anyway</button>
+  </div>
+
+  <!-- ░░ Verdict hero ░░ -->
+  <section id="verdict" class="hidden bg-slate-900/70 backdrop-blur border border-slate-800 rounded-2xl p-6 mb-6 shadow-xl shadow-black/30">
+    <div class="flex items-start justify-between gap-6 flex-wrap">
+      <div class="min-w-[220px]">
+        <div class="text-xs uppercase tracking-widest text-slate-500 mb-1">Verdict</div>
+        <div id="verdict-word" class="text-4xl font-black leading-none">—</div>
+        <div id="verdict-sub" class="text-sm text-slate-400 mt-2">Agents are deliberating…</div>
+      </div>
+      <!-- rating scale gauge -->
+      <div class="flex-1 min-w-[280px]">
+        <div class="flex justify-between text-[10px] uppercase tracking-wide text-slate-500 mb-1.5">
+          <span>Sell</span><span>Underweight</span><span>Hold</span><span>Overweight</span><span>Buy</span>
+        </div>
+        <div class="relative h-3 rounded-full" style="background:linear-gradient(90deg,#f43f5e,#fb923c,#94a3b8,#4ade80,#10b981)">
+          <div id="verdict-marker" class="absolute -top-1.5 w-6 h-6 rounded-full border-2 border-white bg-slate-900 shadow-lg transition-all duration-700 hidden" style="left:50%;transform:translateX(-50%)"></div>
+        </div>
+        <div class="mt-4">
+          <button id="verdict-toggle" class="hidden text-xs text-emerald-300 hover:text-emerald-200">▸ Show full Portfolio Manager rationale</button>
+          <div id="verdict-rationale" class="feed-md text-sm text-slate-300 mt-2 hidden scroll-body"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ░░ Stage stepper ░░ -->
+  <section id="stepper" class="hidden grid grid-cols-2 md:grid-cols-5 gap-2 mb-6"></section>
+
+  <!-- ░░ Identity ░░ -->
+  <div id="identity" class="hidden bg-slate-900/50 border border-slate-800 rounded-xl px-4 py-2.5 mb-5 text-xs text-slate-400 whitespace-pre-wrap font-mono leading-relaxed"></div>
+
+  <!-- ░░ Pipeline strip ░░ -->
+  <section id="pipeline-wrap" class="hidden bg-slate-900/50 border border-slate-800 rounded-xl p-3 mb-6">
+    <div id="pipeline" class="flex flex-wrap items-center gap-1.5 text-xs"></div>
+  </section>
+
+  <!-- ░░ Stage feed ░░ -->
+  <div id="stages" class="space-y-7"></div>
+
+  <!-- empty state -->
+  <div id="empty" class="text-center text-slate-600 py-16">
+    <div class="text-5xl mb-3">📊</div>
+    <p class="text-sm">Enter a ticker and run an analysis to watch the desk work.</p>
+  </div>
+</div>
+
+<!-- ░░ Admin modal ░░ -->
+<div id="admin-modal" class="hidden fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+  <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-md p-6 shadow-2xl">
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="text-lg font-bold text-white">⚙ Admin settings</h3>
+      <button id="admin-close" class="text-slate-500 hover:text-slate-200 text-xl leading-none">×</button>
+    </div>
+    <div id="admin-locked">
+      <label class="block text-xs text-slate-400 mb-1.5">Admin password</label>
+      <input id="admin-pw" type="password" class="w-full bg-slate-950/60 border border-slate-700 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-emerald-400" placeholder="Enter admin password" />
+      <button id="admin-unlock" class="mt-3 w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold rounded-lg px-4 py-2.5 text-sm transition">Unlock</button>
+      <p id="admin-msg" class="text-xs text-rose-400 mt-2 h-4"></p>
+    </div>
+    <div id="admin-panel" class="hidden">
+      <div class="flex items-center justify-between bg-slate-950/50 border border-slate-800 rounded-xl px-4 py-3">
+        <div>
+          <div class="text-sm font-medium text-slate-200">60-minute cache</div>
+          <div class="text-xs text-slate-500">Serve a recent stored run for a ticker instead of re-running.</div>
+        </div>
+        <button id="cache-switch" role="switch" class="relative w-12 h-6 rounded-full bg-slate-700 transition shrink-0">
+          <span class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-all"></span>
+        </button>
+      </div>
+      <p id="admin-panel-msg" class="text-xs text-slate-500 mt-3"></p>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── metadata ──────────────────────────────────────────────────────────────
+const STAGES = [
+  { key: "Analysis",        label: "Analysis",        icon: "🔎", color: "#38bdf8" },
+  { key: "Research Debate", label: "Research Debate", icon: "⚔️", color: "#a78bfa" },
+  { key: "Trading Plan",    label: "Trading Plan",    icon: "💼", color: "#fbbf24" },
+  { key: "Risk Debate",     label: "Risk Debate",     icon: "🛡️", color: "#fb7185" },
+  { key: "Decision",        label: "Decision",        icon: "🎯", color: "#34d399" },
+];
+const NODE = {
+  "Market Analyst":       { stage: "Analysis", icon: "📈", color: "#38bdf8", blurb: "Price action & technicals" },
+  "Sentiment Analyst":    { stage: "Analysis", icon: "💬", color: "#22d3ee", blurb: "Social & retail sentiment" },
+  "News Analyst":         { stage: "Analysis", icon: "📰", color: "#818cf8", blurb: "Macro & headlines" },
+  "Fundamentals Analyst": { stage: "Analysis", icon: "📊", color: "#0ea5e9", blurb: "Financials & valuation" },
+  "Bull Researcher":      { stage: "Research Debate", icon: "🐂", color: "#34d399", blurb: "The case to buy" },
+  "Bear Researcher":      { stage: "Research Debate", icon: "🐻", color: "#fb7185", blurb: "The case to sell" },
+  "Research Manager":     { stage: "Research Debate", icon: "🧭", color: "#a78bfa", blurb: "Judges the debate" },
+  "Trader":               { stage: "Trading Plan", icon: "💼", color: "#fbbf24", blurb: "Concrete trade plan" },
+  "Aggressive Analyst":   { stage: "Risk Debate", icon: "🚀", color: "#fb923c", blurb: "Risk-on view" },
+  "Conservative Analyst": { stage: "Risk Debate", icon: "🛡️", color: "#38bdf8", blurb: "Risk-off view" },
+  "Neutral Analyst":      { stage: "Risk Debate", icon: "⚖️", color: "#94a3b8", blurb: "Balanced view" },
+  "Portfolio Manager":    { stage: "Decision", icon: "🎯", color: "#34d399", blurb: "Final call" },
+};
+const RATING_POS = { Sell:0, Underweight:25, Hold:50, Overweight:75, Buy:100 };
+const RATING_COLOR = { Sell:"#f43f5e", Underweight:"#fb923c", Hold:"#94a3b8", Overweight:"#4ade80", Buy:"#10b981" };
+
+const $ = (id) => document.getElementById(id);
+let plannedNodes = [], nodeEls = {}, cardEls = {}, sectionEls = {};
+let activeES = null, t0 = 0, timerInt = null, currentParams = null;
+
+function tint(hex, a){ return hex + Math.round(a*255).toString(16).padStart(2,"0"); }
+function avatarTile(icon, color, size){
+  // Role-themed avatar: a gradient badge in the agent's accent color with its
+  // symbolic glyph (bull/bear/charts/shield/target...). No external dependency.
+  const s=size||40, fs=Math.round(s*0.5);
+  return `<div class="rounded-full flex items-center justify-center shrink-0"
+    style="width:${s}px;height:${s}px;font-size:${fs}px;line-height:1;
+      background:radial-gradient(circle at 30% 25%, ${tint(color,.38)}, ${tint(color,.10)});
+      border:1px solid ${tint(color,.6)}; box-shadow:0 0 12px ${tint(color,.18)}, inset 0 0 0 1px ${tint(color,.12)}">${icon}</div>`;
+}
+function statusPill(text, color="#94a3b8"){ const e=$("status-pill"); e.textContent=text; e.style.color=color; e.style.borderColor=tint(color,.5); }
+function startTimer(){ t0=Date.now(); $("timer").classList.remove("hidden"); timerInt=setInterval(()=>{ $("timer").textContent=((Date.now()-t0)/1000).toFixed(1)+"s"; },100); }
+function stopTimer(){ clearInterval(timerInt); }
+
+async function loadConfig(){
+  const cfg = await (await fetch("/api/config")).json();
+  $("provider").value=cfg.provider||""; $("deep_model").value=cfg.deep_model||"";
+  $("quick_model").value=cfg.quick_model||""; $("max_debate_rounds").value=cfg.max_debate_rounds??1; $("max_risk_rounds").value=cfg.max_risk_rounds??1;
+  const wrap=$("analysts"); wrap.innerHTML="";
+  cfg.analysts.forEach((a)=>{
+    const id="an_"+a, disp=cfg.analyst_display[a], meta=NODE[disp]||{color:"#94a3b8",icon:""};
+    const l=document.createElement("label");
+    l.className="flex items-center gap-1.5 cursor-pointer px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-950/40 hover:border-slate-500 transition text-xs";
+    l.innerHTML=`<input type="checkbox" id="${id}" value="${a}" checked class="accent-emerald-500" /> ${avatarTile(meta.icon, meta.color, 22)} ${disp}`;
+    wrap.appendChild(l);
+  });
+  $("trade_date").value=new Date().toISOString().slice(0,10);
+}
+
+// ── stepper ───────────────────────────────────────────────────────────────
+function buildStepper(){
+  const present = STAGES.filter(s => plannedNodes.some(n => NODE[n]?.stage === s.key));
+  const wrap=$("stepper"); wrap.innerHTML=""; wrap.classList.remove("hidden");
+  present.forEach(s=>{
+    const total = plannedNodes.filter(n=>NODE[n]?.stage===s.key).length;
+    const el=document.createElement("div");
+    el.dataset.stage=s.key;
+    el.className="rounded-xl border border-slate-800 bg-slate-900/50 px-3 py-2.5";
+    el.innerHTML=`<div class="flex items-center justify-between">
+        <span class="text-xs font-medium" style="color:${s.color}">${s.icon} ${s.label}</span>
+        <span class="text-[10px] text-slate-500" data-count>0/${total}</span>
+      </div>
+      <div class="mt-2 h-1 rounded-full bg-slate-800 overflow-hidden"><div data-bar class="h-full rounded-full transition-all duration-500" style="width:0%;background:${s.color}"></div></div>`;
+    wrap.appendChild(el);
+  });
+  $("stepper").style.gridTemplateColumns=`repeat(${Math.min(present.length,5)},minmax(0,1fr))`;
+}
+function refreshStepper(){
+  STAGES.forEach(s=>{
+    const el=$("stepper").querySelector(`[data-stage="${s.key}"]`); if(!el) return;
+    const nodes=plannedNodes.filter(n=>NODE[n]?.stage===s.key);
+    const done=nodes.filter(n=>nodeEls[n]?.dataset.state==="done").length;
+    el.querySelector("[data-count]").textContent=`${done}/${nodes.length}`;
+    el.querySelector("[data-bar]").style.width=(nodes.length?done/nodes.length*100:0)+"%";
+  });
+}
+
+// ── pipeline strip ──────────────────────────────────────────────────────────
+function buildPipeline(nodes){
+  plannedNodes=nodes; nodeEls={}; const wrap=$("pipeline"); wrap.innerHTML="";
+  $("pipeline-wrap").classList.remove("hidden");
+  nodes.forEach((n,i)=>{
+    const m=NODE[n]||{icon:"•",color:"#94a3b8"};
+    const pill=document.createElement("div");
+    pill.dataset.state="pending"; pill.dataset.node=n;
+    pill.className="px-2 py-1 rounded-lg border text-slate-400 transition flex items-center gap-1";
+    pill.style.borderColor="#334155"; pill.style.background="#0f172a80";
+    pill.innerHTML=`<span data-dot>○</span><span>${m.icon}</span><span class="hidden sm:inline">${n}</span>`;
+    nodeEls[n]=pill; wrap.appendChild(pill);
+    if(i<nodes.length-1){ const a=document.createElement("span"); a.className="text-slate-700"; a.textContent="›"; wrap.appendChild(a); }
+  });
+}
+function setNodeState(n,state){
+  const el=nodeEls[n]; if(!el) return; const m=NODE[n]||{color:"#94a3b8"};
+  el.dataset.state=state; const dot=el.querySelector("[data-dot]");
+  if(state==="running"){ el.style.borderColor=m.color; el.style.background=tint(m.color,.12); el.style.color=m.color; dot.textContent="◍"; dot.className="pulse-dot"; }
+  else if(state==="done"){ el.style.borderColor=m.color; el.style.background=tint(m.color,.16); el.style.color=m.color; dot.textContent="✓"; dot.className=""; }
+  refreshStepper();
+}
+function markRunningNext(doneNode){
+  const i=plannedNodes.indexOf(doneNode);
+  for(let j=i+1;j<plannedNodes.length;j++){ if(nodeEls[plannedNodes[j]]){ setNodeState(plannedNodes[j],"running"); break; } }
+}
+
+// ── stage feed ────────────────────────────────────────────────────────────
+function section(stageKey){
+  if(sectionEls[stageKey]) return sectionEls[stageKey];
+  const s=STAGES.find(x=>x.key===stageKey);
+  const sec=document.createElement("section"); sec.className="slide-in";
+  sec.innerHTML=`<div class="flex items-center gap-2 mb-3">
+      <span class="text-sm font-semibold" style="color:${s.color}">${s.icon} ${s.label}</span>
+      <div class="flex-1 h-px" style="background:linear-gradient(90deg,${tint(s.color,.5)},transparent)"></div>
+    </div><div class="space-y-3" data-cards></div>`;
+  $("stages").appendChild(sec); sectionEls[stageKey]=sec; return sec;
+}
+function plainPreview(html){ const d=document.createElement("div"); d.innerHTML=html; const t=(d.textContent||"").replace(/\s+/g," ").trim(); return t.slice(0,170)+(t.length>170?"…":""); }
+
+function feedCard(node){
+  if(cardEls[node]) return cardEls[node];
+  const m=NODE[node]||{icon:"•",color:"#94a3b8",blurb:""};
+  const sec=section(m.stage);
+  const card=document.createElement("div");
+  card.className="rounded-xl border bg-slate-900/60 overflow-hidden slide-in";
+  card.style.borderColor="#1e293b"; card.style.borderLeft=`3px solid ${m.color}`;
+  card.innerHTML=`
+    <div class="flex items-center gap-3 px-4 py-3 cursor-pointer select-none" data-toggle>
+      ${avatarTile(m.icon, m.color, 40)}
+      <div class="min-w-0 flex-1">
+        <div class="flex items-center gap-2"><span class="font-semibold text-slate-100">${node}</span><span class="text-[10px] text-slate-500">${m.blurb}</span></div>
+        <div class="text-xs text-slate-500 truncate" data-preview>—</div>
+      </div>
+      <span class="text-xs flex items-center gap-1.5 shrink-0" data-badge style="color:#fbbf24"><span class="w-1.5 h-1.5 rounded-full bg-amber-400 pulse-dot"></span>working</span>
+      <span class="text-slate-600 text-xs" data-chev>▸</span>
+    </div>
+    <div class="px-4 pb-4 pt-1 feed-md text-sm text-slate-300 hidden scroll-body" data-body></div>`;
+  card.querySelector("[data-toggle]").onclick=()=>{
+    const b=card.querySelector("[data-body]"), c=card.querySelector("[data-chev]");
+    const hidden=b.classList.toggle("hidden"); c.textContent=hidden?"▸":"▾";
+  };
+  sec.querySelector("[data-cards]").appendChild(card); cardEls[node]=card;
+  card.scrollIntoView({behavior:"smooth",block:"nearest"});
+  return card;
+}
+function updateCard(node,{status,content}){
+  const card=feedCard(node);
+  const badge=card.querySelector("[data-badge]"), body=card.querySelector("[data-body]"), prev=card.querySelector("[data-preview]");
+  if(status==="running"){ badge.innerHTML=`<span class="w-1.5 h-1.5 rounded-full bg-amber-400 pulse-dot"></span>working`; badge.style.color="#fbbf24"; return; }
+  if(status==="done"){
+    badge.innerHTML=`✓ done`; badge.style.color="#34d399";
+    if(content&&content.trim()){ const html=marked.parse(content); body.innerHTML=html; prev.textContent=plainPreview(html); }
+    else { body.innerHTML=`<span class="text-slate-500 italic">No textual output.</span>`; prev.textContent="—"; }
+    if(node==="Market Analyst" && currentParams && !card.querySelector("[data-chart]")){
+      const chart=document.createElement("div"); chart.setAttribute("data-chart","");
+      card.querySelector("[data-body]").before(chart);
+      loadChart(chart, currentParams);
+    }
+  }
+}
+
+// ── price chart (Market Analyst) ────────────────────────────────────────────
+function loadChart(container, params){
+  container.className="px-4 pb-3";
+  container.innerHTML=`<div class="text-xs text-slate-500 py-3">Loading price chart…</div>`;
+  const q=`ticker=${encodeURIComponent(params.ticker)}&trade_date=${encodeURIComponent(params.trade_date)}&asset_type=${encodeURIComponent(params.asset_type||"stock")}`;
+  fetch(`/api/chart?${q}`)
+    .then(r=> r.ok ? r.json() : Promise.reject(r.status))
+    .then(d=> renderChart(container, d))
+    .catch(()=>{ container.innerHTML=`<div class="text-xs text-slate-500 py-2">Price chart unavailable for this instrument.</div>`; });
+}
+function renderChart(container, d){
+  if(!window.LightweightCharts){ container.innerHTML=`<div class="text-xs text-slate-500">Charting library failed to load.</div>`; return; }
+  container.innerHTML="";
+  const LC=window.LightweightCharts, DASH=(LC.LineStyle&&LC.LineStyle.Dashed)||2;
+  const legend=document.createElement("div");
+  legend.className="flex flex-wrap gap-3 text-[10px] text-slate-400 mb-1";
+  legend.innerHTML=`<span class="font-semibold text-slate-300">${d.symbol}</span>
+    <span><span style="color:#38bdf8">━</span> SMA50</span>
+    <span><span style="color:#a78bfa">━</span> SMA200</span>
+    <span><span style="color:#64748b">┄</span> Bollinger</span>
+    <span><span style="color:#fbbf24">━</span> RSI</span>`;
+  container.appendChild(legend);
+
+  const priceEl=document.createElement("div"); container.appendChild(priceEl);
+  const opts={ layout:{background:{color:"transparent"},textColor:"#94a3b8"},
+    grid:{vertLines:{color:"#1e293b"},horzLines:{color:"#1e293b"}},
+    rightPriceScale:{borderColor:"#334155"}, timeScale:{borderColor:"#334155"},
+    crosshair:{mode:0}, width:container.clientWidth||640, height:300 };
+  const price=LC.createChart(priceEl, opts);
+  const candle=price.addCandlestickSeries({upColor:"#34d399",downColor:"#fb7185",borderVisible:false,wickUpColor:"#34d399",wickDownColor:"#fb7185"});
+  candle.setData(d.candles);
+  const vol=price.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:""});
+  vol.priceScale().applyOptions({scaleMargins:{top:0.82,bottom:0}});
+  vol.setData(d.volume);
+  const I=d.indicators||{};
+  const line=(name,color,style)=>{ if(!I[name]) return; const s=price.addLineSeries({color,lineWidth:2,lineStyle:style||0,priceLineVisible:false,lastValueVisible:false}); s.setData(I[name]); };
+  line("close_50_sma","#38bdf8"); line("close_200_sma","#a78bfa");
+  line("boll_ub","#64748b",DASH); line("boll_lb","#64748b",DASH);
+  price.timeScale().fitContent();
+
+  const charts=[price];
+  if(I.rsi){
+    const rsiEl=document.createElement("div"); container.appendChild(rsiEl);
+    const rsi=LC.createChart(rsiEl, {...opts, height:110});
+    const rs=rsi.addLineSeries({color:"#fbbf24",lineWidth:2,priceLineVisible:false,lastValueVisible:true});
+    rs.setData(I.rsi);
+    rs.createPriceLine({price:70,color:"#fb7185",lineStyle:DASH,lineWidth:1,axisLabelVisible:true,title:"70"});
+    rs.createPriceLine({price:30,color:"#34d399",lineStyle:DASH,lineWidth:1,axisLabelVisible:true,title:"30"});
+    rsi.timeScale().fitContent();
+    charts.push(rsi);
+  }
+  // keep panes' time axes in sync + responsive width
+  const sync=(src)=>src.timeScale().subscribeVisibleLogicalRangeChange(r=>{ if(r) charts.forEach(c=>{ if(c!==src) c.timeScale().setVisibleLogicalRange(r); }); });
+  charts.forEach(sync);
+  const ro=new ResizeObserver(()=>{ const w=container.clientWidth||640; charts.forEach(c=>c.applyOptions({width:w})); });
+  ro.observe(container);
+}
+
+// ── verdict ───────────────────────────────────────────────────────────────
+function showVerdict(decision,content){
+  $("verdict-sub").textContent="Synthesis of the full debate";
+  const word=$("verdict-word"); word.textContent=decision; word.style.color=RATING_COLOR[decision]||"#94a3b8";
+  const mk=$("verdict-marker"); mk.classList.remove("hidden"); mk.style.left=(RATING_POS[decision]??50)+"%"; mk.style.background=RATING_COLOR[decision]||"#0f172a"; mk.style.borderColor="#fff";
+  if(content&&content.trim()){
+    const t=$("verdict-toggle"), r=$("verdict-rationale"); t.classList.remove("hidden"); r.innerHTML=marked.parse(content);
+    t.onclick=()=>{ const h=r.classList.toggle("hidden"); t.textContent=(h?"▸":"▾")+" "+(h?"Show":"Hide")+" full Portfolio Manager rationale"; };
+  }
+}
+
+// ── event handling ──────────────────────────────────────────────────────────
+function handleEvent(ev){
+  switch(ev.type){
+    case "nodes": buildPipeline(ev.nodes); buildStepper(); if(ev.nodes.length) setNodeState(ev.nodes[0],"running"); break;
+    case "status": statusPill(ev.message,"#fbbf24"); $("verdict-sub").textContent=ev.message; break;
+    case "identity": $("identity").classList.remove("hidden"); $("identity").textContent=ev.content; break;
+    case "agent":
+      if(ev.status==="running"){ setNodeState(ev.node,"running"); feedCard(ev.node); }
+      else { setNodeState(ev.node,"done"); updateCard(ev.node,{status:"done",content:ev.content}); markRunningNext(ev.node); }
+      break;
+    case "final": showVerdict(ev.decision,ev.content); break;
+    case "error": statusPill("error","#f43f5e"); showError(ev.message); break;
+    case "done": statusPill("complete","#34d399"); stopTimer(); $("run-btn").disabled=false; $("new-run").disabled=false; if(activeES) activeES.close(); break;
+  }
+}
+function showError(msg){
+  $("verdict").classList.remove("hidden");
+  $("verdict-word").textContent="Failed"; $("verdict-word").style.color="#f43f5e";
+  $("verdict-sub").textContent=msg; $("verdict-marker").classList.add("hidden");
+}
+
+function resetUI(){
+  $("stages").innerHTML=""; $("identity").classList.add("hidden"); $("identity").textContent="";
+  $("verdict-rationale").classList.add("hidden"); $("verdict-toggle").classList.add("hidden");
+  $("cache-banner").classList.add("hidden"); $("cache-banner").style.display="none";
+  cardEls={}; sectionEls={}; $("empty").classList.add("hidden");
+}
+
+// ── cached render (60-minute cache hit) ─────────────────────────────────────
+function showCacheBanner(createdAt){
+  let when=createdAt;
+  try{ when=new Date(createdAt).toLocaleString(); }catch{}
+  $("cache-banner-text").textContent=`The last update for this ticker was made within 60 minutes (${when}).`;
+  const b=$("cache-banner"); b.classList.remove("hidden"); b.style.display="flex";
+}
+function renderCached(run){
+  currentParams={ticker:run.ticker, trade_date:run.trade_date, asset_type:run.asset_type||"stock"};
+  const agents=(run.agents||[]).slice().sort((a,b)=>(a.seq||0)-(b.seq||0));
+  const nodes=[]; agents.forEach(a=>{ if(!nodes.includes(a.agent)) nodes.push(a.agent); });
+  buildPipeline(nodes); buildStepper();
+  nodes.forEach(n=>setNodeState(n,"done"));
+  if(run.identity){ $("identity").classList.remove("hidden"); $("identity").textContent=run.identity; }
+  agents.forEach(a=>updateCard(a.agent,{status:"done",content:a.content}));
+  $("verdict").classList.remove("hidden");
+  showVerdict(run.decision||"Hold", run.final_content||"");
+  showCacheBanner(run.created_at);
+  statusPill("from cache","#38bdf8"); stopTimer();
+  $("run-btn").disabled=false; $("new-run").disabled=false;
+}
+
+$("new-run").onclick=()=>{ $("run-form").classList.remove("hidden"); $("run-summary").classList.add("hidden"); };
+$("run-fresh").onclick=()=>startRun(true);
+
+async function startRun(force){
+  resetUI();
+  const analysts=[...document.querySelectorAll("#analysts input:checked")].map(c=>c.value);
+  if(!analysts.length){ statusPill("pick an analyst","#f43f5e"); return; }
+  $("run-btn").disabled=true; $("new-run").disabled=true; statusPill(force?"running fresh…":"starting…","#fbbf24");
+  $("verdict").classList.remove("hidden"); $("verdict-word").textContent="…"; $("verdict-word").style.color="#94a3b8"; $("verdict-marker").classList.add("hidden"); $("verdict-sub").textContent="Agents are deliberating…";
+
+  const body={ ticker:$("ticker").value.trim().toUpperCase(), trade_date:$("trade_date").value, asset_type:$("asset_type").value, analysts,
+    provider:$("provider").value.trim()||null, deep_model:$("deep_model").value.trim()||null, quick_model:$("quick_model").value.trim()||null,
+    max_debate_rounds:parseInt($("max_debate_rounds").value)||null, max_risk_rounds:parseInt($("max_risk_rounds").value)||null, force:!!force };
+  currentParams={ticker:body.ticker, trade_date:body.trade_date, asset_type:body.asset_type};
+
+  $("run-summary-text").textContent=`${body.ticker} · ${body.trade_date} · ${analysts.length} analyst${analysts.length>1?"s":""}`;
+  $("run-form").classList.add("hidden"); $("run-summary").classList.remove("hidden");
+
+  let res;
+  try{ res=await fetch("/api/runs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); }
+  catch{ showError("Could not reach the server. Is it running?"); $("run-btn").disabled=false; $("new-run").disabled=false; statusPill("error","#f43f5e"); return; }
+  if(!res.ok){ const err=await res.json().catch(()=>({})); showError((err.detail&&JSON.stringify(err.detail))||`Request failed (${res.status})`); $("run-btn").disabled=false; $("new-run").disabled=false; statusPill("error","#f43f5e"); return; }
+  const data=await res.json();
+
+  if(data.cached && data.run){ renderCached(data.run); return; }
+
+  startTimer();
+  activeES=new EventSource(`/api/runs/${data.run_id}/events`);
+  activeES.onmessage=(m)=>handleEvent(JSON.parse(m.data));
+  activeES.onerror=()=>{ if($("run-btn").disabled){ statusPill("connection lost","#f43f5e"); stopTimer(); $("run-btn").disabled=false; $("new-run").disabled=false; } activeES.close(); };
+}
+
+$("run-form").addEventListener("submit",(e)=>{ e.preventDefault(); startRun(false); });
+
+// ── admin panel ─────────────────────────────────────────────────────────────
+let adminPw="";
+function setSwitch(on){
+  const sw=$("cache-switch"), knob=sw.firstElementChild;
+  sw.dataset.on=on?"1":"0";
+  sw.style.background=on?"#10b981":"#334155";
+  knob.style.left=on?"auto":"0.125rem"; knob.style.right=on?"0.125rem":"auto";
+}
+$("admin-btn").onclick=()=>{
+  $("admin-modal").classList.remove("hidden");
+  $("admin-locked").classList.remove("hidden"); $("admin-panel").classList.add("hidden");
+  $("admin-msg").textContent=""; $("admin-pw").value=""; $("admin-pw").focus();
+};
+$("admin-close").onclick=()=>$("admin-modal").classList.add("hidden");
+$("admin-modal").onclick=(e)=>{ if(e.target===$("admin-modal")) $("admin-modal").classList.add("hidden"); };
+$("admin-unlock").onclick=async()=>{
+  const pw=$("admin-pw").value;
+  const res=await fetch("/api/admin/settings",{headers:{"X-Admin-Password":pw}});
+  if(res.status===401){ $("admin-msg").textContent="Invalid admin password."; return; }
+  if(res.status===503){ $("admin-msg").textContent="Admin features are not configured (set STOCKAGENTS_ADMIN_PASSWORD)."; return; }
+  if(!res.ok){ $("admin-msg").textContent="Could not load settings."; return; }
+  const s=await res.json();
+  adminPw=pw;
+  $("admin-locked").classList.add("hidden"); $("admin-panel").classList.remove("hidden");
+  setSwitch(!!s.cache_enabled);
+  $("admin-panel-msg").textContent=s.supabase_configured?`Window: ${s.cache_window_minutes} minutes.`:"Supabase not configured — toggle has no effect yet.";
+};
+$("cache-switch").onclick=async()=>{
+  const next=$("cache-switch").dataset.on!=="1";
+  const res=await fetch("/api/admin/cache",{method:"POST",headers:{"Content-Type":"application/json","X-Admin-Password":adminPw},body:JSON.stringify({enabled:next})});
+  if(res.ok){ setSwitch(next); $("admin-panel-msg").textContent=`60-minute cache ${next?"enabled":"disabled"}.`; }
+  else { const e=await res.json().catch(()=>({})); $("admin-panel-msg").textContent=e.detail||"Update failed."; }
+};
+
+loadConfig();
+</script>
+</body>
+</html>

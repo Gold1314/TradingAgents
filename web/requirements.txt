@@ -1,0 +1,6 @@
+# Web UI layer for TradingAgents (additive; install on top of the core deps).
+fastapi>=0.110
+uvicorn[standard]>=0.29
+# Optional: persistence + 60-min cache. The app runs fine without Supabase
+# configured (storage/cache simply no-op until SUPABASE_URL/KEY are set).
+supabase>=2.4
