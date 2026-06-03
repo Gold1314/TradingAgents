@@ -19,6 +19,8 @@
     .pulse-dot { animation:pulse-dot 1s infinite; }
     @keyframes slide-in { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
     .slide-in { animation:slide-in .35s ease both; }
+    @keyframes attn-pulse { 0%,100%{box-shadow:0 0 0 0 rgba(52,211,153,0);} 50%{box-shadow:0 0 0 7px rgba(52,211,153,.12);} }
+    .attention-pulse { animation:attn-pulse 1.9s ease-in-out infinite; }
     .feed-md{line-height:1.6;}
     .feed-md h1,.feed-md h2,.feed-md h3{font-weight:600;margin:.8em 0 .35em;color:#f1f5f9;}
     .feed-md h1{font-size:1.05rem;} .feed-md h2{font-size:.98rem;} .feed-md h3{font-size:.9rem;color:#cbd5e1;}
@@ -156,7 +158,11 @@
           <div id="verdict-marker" class="absolute -top-1.5 w-6 h-6 rounded-full border-2 border-white bg-slate-900 shadow-lg transition-all duration-700 hidden" style="left:50%;transform:translateX(-50%)"></div>
         </div>
         <div class="mt-4">
-          <button id="verdict-toggle" class="hidden text-xs text-emerald-300 hover:text-emerald-200">▸ Show full Portfolio Manager rationale</button>
+          <button id="verdict-toggle" style="display:none" class="inline-flex items-center gap-2.5 pl-1.5 pr-4 py-1.5 rounded-full border border-emerald-500/60 bg-emerald-500/10 text-emerald-200 text-xs font-semibold hover:bg-emerald-500/20 hover:border-emerald-400 active:scale-95 transition attention-pulse">
+            <span data-chev class="flex items-center justify-center w-6 h-6 rounded-full bg-emerald-500/30 text-emerald-100 text-sm leading-none transition-transform duration-300">▾</span>
+            <span data-label>Read the Portfolio Manager's full rationale</span>
+            <span data-hint class="text-[10px] uppercase tracking-widest text-emerald-400/70">click</span>
+          </button>
           <div id="verdict-rationale" class="feed-md text-sm text-slate-300 mt-2 hidden scroll-body"></div>
         </div>
       </div>
@@ -238,7 +244,23 @@ const NODE = {
 const RATING_POS = { Sell:0, Underweight:25, Hold:50, Overweight:75, Buy:100 };
 const RATING_COLOR = { Sell:"#f43f5e", Underweight:"#fb923c", Hold:"#94a3b8", Overweight:"#4ade80", Buy:"#10b981" };
 
+// Pipeline composition (derived from the agent metadata above):
+// selectable data analysts (Analysis stage) vs. the always-on downstream agents.
+const ANALYST_TOTAL = Object.values(NODE).filter(m=>m.stage==="Analysis").length;   // 4 selectable analysts
+const FIXED_AGENTS  = Object.keys(NODE).length - ANALYST_TOTAL;                       // 8 fixed agents
+function runSummaryLabel(ticker, tradeDate, selectedAnalysts, totalAgents){
+  return `${ticker} · ${tradeDate} · ${selectedAnalysts}/${ANALYST_TOTAL} analysts · ${totalAgents} agents`;
+}
+
 const $ = (id) => document.getElementById(id);
+
+// Agents write "~" to mean "approximately" (e.g. ~26x, ~0.97x). Disable marked's
+// GFM strikethrough so a pair of those tildes doesn't strike through the text
+// between them. Tildes then render as literal characters.
+if(window.marked && marked.use){
+  marked.use({ tokenizer: { del(){ return undefined; } } });
+}
+
 let plannedNodes = [], nodeEls = {}, cardEls = {}, sectionEls = {};
 let activeES = null, t0 = 0, timerInt = null, currentParams = null;
 let marketChartEl = null;  // chart container kept for PDF export
@@ -447,8 +469,17 @@ function showVerdict(decision,content){
   const word=$("verdict-word"); word.textContent=decision; word.style.color=RATING_COLOR[decision]||"#94a3b8";
   const mk=$("verdict-marker"); mk.classList.remove("hidden"); mk.style.left=(RATING_POS[decision]??50)+"%"; mk.style.background=RATING_COLOR[decision]||"#0f172a"; mk.style.borderColor="#fff";
   if(content&&content.trim()){
-    const t=$("verdict-toggle"), r=$("verdict-rationale"); t.classList.remove("hidden"); r.innerHTML=marked.parse(content);
-    t.onclick=()=>{ const h=r.classList.toggle("hidden"); t.textContent=(h?"▸":"▾")+" "+(h?"Show":"Hide")+" full Portfolio Manager rationale"; };
+    const t=$("verdict-toggle"), r=$("verdict-rationale");
+    t.style.display="inline-flex"; t.classList.add("attention-pulse"); r.innerHTML=marked.parse(content); r.classList.add("hidden");
+    const chev=t.querySelector("[data-chev]"), label=t.querySelector("[data-label]"), hint=t.querySelector("[data-hint]");
+    chev.style.transform="rotate(0deg)"; label.textContent="Read the Portfolio Manager's full rationale"; if(hint) hint.style.display="";
+    t.onclick=()=>{
+      const collapsed=r.classList.toggle("hidden");
+      t.classList.remove("attention-pulse");            // stop nudging once they've engaged
+      if(hint) hint.style.display="none";
+      chev.style.transform=collapsed?"rotate(0deg)":"rotate(180deg)";
+      label.textContent=collapsed?"Read the Portfolio Manager's full rationale":"Hide the Portfolio Manager's rationale";
+    };
   }
 }
 
@@ -475,7 +506,7 @@ function showError(msg){
 
 function resetUI(){
   $("stages").innerHTML=""; $("identity").classList.add("hidden"); $("identity").textContent="";
-  $("verdict-rationale").classList.add("hidden"); $("verdict-toggle").classList.add("hidden");
+  $("verdict-rationale").classList.add("hidden"); $("verdict-toggle").style.display="none"; $("verdict-toggle").classList.remove("attention-pulse");
   $("cache-banner").classList.add("hidden"); $("cache-banner").style.display="none";
   cardEls={}; sectionEls={}; marketChartEl=null; $("empty").classList.add("hidden");
   $("download-pdf").classList.add("hidden");
@@ -492,6 +523,8 @@ function renderCached(run){
   currentParams={ticker:run.ticker, trade_date:run.trade_date, asset_type:run.asset_type||"stock"};
   const agents=(run.agents||[]).slice().sort((a,b)=>(a.seq||0)-(b.seq||0));
   const nodes=[]; agents.forEach(a=>{ if(!nodes.includes(a.agent)) nodes.push(a.agent); });
+  const selAnalysts=nodes.filter(n=>NODE[n]?.stage==="Analysis").length;
+  $("run-summary-text").textContent=runSummaryLabel(run.ticker, run.trade_date, selAnalysts, nodes.length);
   buildPipeline(nodes); buildStepper();
   nodes.forEach(n=>setNodeState(n,"done"));
   if(run.identity){ $("identity").classList.remove("hidden"); $("identity").textContent=run.identity; }
@@ -518,7 +551,7 @@ async function startRun(force){
     max_debate_rounds:parseInt($("max_debate_rounds").value)||null, max_risk_rounds:parseInt($("max_risk_rounds").value)||null, force:!!force };
   currentParams={ticker:body.ticker, trade_date:body.trade_date, asset_type:body.asset_type};
 
-  $("run-summary-text").textContent=`${body.ticker} · ${body.trade_date} · ${analysts.length} analyst${analysts.length>1?"s":""}`;
+  $("run-summary-text").textContent=runSummaryLabel(body.ticker, body.trade_date, analysts.length, analysts.length+FIXED_AGENTS);
   $("run-form").classList.add("hidden"); $("run-summary").classList.remove("hidden");
 
   let res;
@@ -611,6 +644,27 @@ function buildExportRoot(){
   return root;
 }
 
+// Find a "safe" horizontal cut row near `targetEnd` so a page break lands in
+// the gap between two text lines instead of slicing through one. Scans upward
+// from targetEnd to minY for a row that is all background, ignoring the card's
+// colored left border/padding column. Returns targetEnd if no gap is found.
+function findCutRow(ctx, width, targetEnd, minY){
+  if(targetEnd-minY<=0) return targetEnd;
+  const skip=Math.min(28, Math.floor(width/4));  // ignore card borders+padding on BOTH sides
+  const band=ctx.getImageData(0, minY, width, targetEnd-minY).data;
+  const rows=targetEnd-minY;
+  for(let ry=rows-1; ry>=0; ry--){
+    let blank=true;
+    const rowOff=ry*width*4;
+    for(let x=skip; x<width-skip; x+=2){
+      const o=rowOff+x*4;
+      if(band[o]<245 || band[o+1]<245 || band[o+2]<245){ blank=false; break; }
+    }
+    if(blank) return minY+ry;                    // cut at this background row
+  }
+  return targetEnd;
+}
+
 async function downloadPDF(){
   if(!currentParams || !window.html2canvas || !(window.jspdf && window.jspdf.jsPDF)) return;
   const btn=$("download-pdf"); const label=btn.textContent;
@@ -647,11 +701,20 @@ async function downloadPDF(){
         pdf.addImage(canvas.toDataURL("image/jpeg",JPEG_Q),"JPEG",margin,cursorY,contentW,blockHmm,undefined,"FAST");
         cursorY+=blockHmm+3;
       } else {
-        // Block taller than a page: slice the canvas into page-height chunks.
-        const sliceHpx=Math.floor(contentH*pxPerMm);
+        // Block taller than a page: slice into page-height chunks, but break at
+        // a gap between lines (not mid-line) by seeking a background row.
+        const maxSliceHpx=Math.floor(contentH*pxPerMm);
+        const lookback=Math.floor(maxSliceHpx*0.18);
+        const cctx=canvas.getContext("2d");
         let sy=0;
         while(sy<canvas.height){
-          const sH=Math.min(sliceHpx,canvas.height-sy);
+          let sliceEnd=Math.min(sy+maxSliceHpx,canvas.height);
+          if(sliceEnd<canvas.height){
+            const minY=Math.max(sy+Math.floor(maxSliceHpx*0.5), sliceEnd-lookback);
+            const cut=findCutRow(cctx,canvas.width,sliceEnd,minY);
+            if(cut>sy) sliceEnd=cut;             // keep progress; else fall back to exact cut
+          }
+          const sH=sliceEnd-sy;
           const slice=document.createElement("canvas");
           slice.width=canvas.width; slice.height=sH;
           slice.getContext("2d").drawImage(canvas,0,sy,canvas.width,sH,0,0,canvas.width,sH);
@@ -660,7 +723,7 @@ async function downloadPDF(){
           const sHmm=sH/pxPerMm;
           pdf.addImage(slice.toDataURL("image/jpeg",JPEG_Q),"JPEG",margin,margin,contentW,sHmm,undefined,"FAST");
           cursorY=margin+sHmm+3;
-          sy+=sH;
+          sy=sliceEnd;
         }
         continue;
       }
