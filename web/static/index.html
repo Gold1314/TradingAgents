@@ -632,9 +632,11 @@ async function downloadPDF(){
     let cursorY=margin;
     let firstPage=true;
 
+    const SCALE=1.5;       // render resolution — keeps text legible at far smaller file size
+    const JPEG_Q=0.72;     // JPEG quality — text survives well below 1.0
     const blocks=root.querySelectorAll(".pdf-block");
     for(const block of blocks){
-      const canvas=await html2canvas(block,{scale:2,backgroundColor:"#ffffff",useCORS:true,logging:false});
+      const canvas=await html2canvas(block,{scale:SCALE,backgroundColor:"#ffffff",useCORS:true,logging:false});
       if(!canvas.width || !canvas.height) continue;
       const pxPerMm=canvas.width/contentW;     // canvas px that map to 1mm of page width
       const blockHmm=canvas.height/pxPerMm;     // full block height in mm
@@ -642,7 +644,7 @@ async function downloadPDF(){
       if(blockHmm<=contentH){
         // Block fits on a page; place it, starting a new page if it won't fit.
         if(!firstPage && cursorY+blockHmm>margin+contentH){ pdf.addPage(); cursorY=margin; }
-        pdf.addImage(canvas.toDataURL("image/jpeg",0.95),"JPEG",margin,cursorY,contentW,blockHmm,undefined,"FAST");
+        pdf.addImage(canvas.toDataURL("image/jpeg",JPEG_Q),"JPEG",margin,cursorY,contentW,blockHmm,undefined,"FAST");
         cursorY+=blockHmm+3;
       } else {
         // Block taller than a page: slice the canvas into page-height chunks.
@@ -656,7 +658,7 @@ async function downloadPDF(){
           if(!firstPage){ pdf.addPage(); }
           firstPage=false;
           const sHmm=sH/pxPerMm;
-          pdf.addImage(slice.toDataURL("image/jpeg",0.95),"JPEG",margin,margin,contentW,sHmm,undefined,"FAST");
+          pdf.addImage(slice.toDataURL("image/jpeg",JPEG_Q),"JPEG",margin,margin,contentW,sHmm,undefined,"FAST");
           cursorY=margin+sHmm+3;
           sy+=sH;
         }
