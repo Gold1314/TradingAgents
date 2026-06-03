@@ -7,6 +7,8 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
   <script>tailwind.config = { darkMode: "class" };</script>
   <style>
     :root { color-scheme: dark; }
@@ -28,6 +30,38 @@
     .feed-md strong{color:#e2e8f0;font-weight:600;} .feed-md a{color:#60a5fa;text-decoration:underline;}
     .feed-md blockquote{border-left:3px solid #475569;padding-left:.8em;color:#94a3b8;margin:.5em 0;}
     .scroll-body{max-height:340px;overflow:auto;} .scroll-body::-webkit-scrollbar{width:8px;} .scroll-body::-webkit-scrollbar-thumb{background:#334155;border-radius:8px;}
+
+    /* ── Light, print-friendly layout used only for the PDF export ─────────── */
+    .pdf-holder{position:absolute;left:-9999px;top:0;pointer-events:none;}
+    .pdf-export{width:760px;background:#ffffff;color:#0f172a;
+      font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+      padding:32px;box-sizing:border-box;line-height:1.55;}
+    .pdf-export .pdf-title{font-size:22px;font-weight:800;color:#0f172a;margin:0;}
+    .pdf-export .pdf-meta{font-size:12px;color:#64748b;margin-top:2px;}
+    .pdf-export .pdf-rule{height:2px;background:linear-gradient(90deg,#10b981,#0ea5e9);border:0;margin:14px 0 18px;border-radius:2px;}
+    .pdf-export .pdf-verdict{display:flex;align-items:baseline;gap:10px;margin:0 0 6px;}
+    .pdf-export .pdf-verdict-label{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#94a3b8;}
+    .pdf-export .pdf-verdict-word{font-size:26px;font-weight:900;line-height:1;}
+    .pdf-export .pdf-identity{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:#475569;
+      background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;white-space:pre-wrap;margin:12px 0;}
+    .pdf-export .pdf-stage{font-size:13px;font-weight:700;color:#0f172a;margin:22px 0 8px;
+      border-bottom:1px solid #e2e8f0;padding-bottom:4px;}
+    .pdf-export .pdf-card{border:1px solid #e2e8f0;border-left:4px solid #94a3b8;border-radius:10px;
+      padding:12px 16px;margin:10px 0;page-break-inside:avoid;}
+    .pdf-export .pdf-card-head{font-weight:700;color:#0f172a;font-size:14px;margin-bottom:2px;}
+    .pdf-export .pdf-card-blurb{font-size:11px;color:#94a3b8;font-weight:400;margin-left:6px;}
+    .pdf-export .pdf-chart{margin:10px 0;}
+    .pdf-export .pdf-chart img{width:100%;height:auto;border:1px solid #e2e8f0;border-radius:8px;}
+    /* light overrides for marked-rendered markdown inside the export */
+    .pdf-export .feed-md{color:#1e293b;}
+    .pdf-export .feed-md h1,.pdf-export .feed-md h2{color:#0f172a;}
+    .pdf-export .feed-md h3{color:#334155;}
+    .pdf-export .feed-md strong{color:#0f172a;}
+    .pdf-export .feed-md a{color:#1d4ed8;}
+    .pdf-export .feed-md code{background:#f1f5f9;color:#b45309;}
+    .pdf-export .feed-md th{background:#f1f5f9;}
+    .pdf-export .feed-md th,.pdf-export .feed-md td{border-color:#cbd5e1;}
+    .pdf-export .feed-md blockquote{border-left-color:#cbd5e1;color:#475569;}
   </style>
 </head>
 <body class="text-slate-200 min-h-screen">
@@ -93,7 +127,10 @@
   <!-- ░░ Compact run summary (after start) ░░ -->
   <div id="run-summary" class="hidden items-center justify-between bg-slate-900/70 border border-slate-800 rounded-xl px-4 py-3 mb-6">
     <div id="run-summary-text" class="text-sm text-slate-300 font-medium"></div>
-    <button id="new-run" class="text-xs px-3 py-1.5 rounded-lg border border-slate-700 hover:border-emerald-400 hover:text-emerald-300 transition">＋ New analysis</button>
+    <div class="flex items-center gap-2">
+      <button id="download-pdf" class="hidden text-xs px-3 py-1.5 rounded-lg border border-emerald-500/60 text-emerald-300 hover:bg-emerald-500/15 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">⬇ Download PDF</button>
+      <button id="new-run" class="text-xs px-3 py-1.5 rounded-lg border border-slate-700 hover:border-emerald-400 hover:text-emerald-300 transition">＋ New analysis</button>
+    </div>
   </div>
 
   <!-- ░░ Cache banner ░░ -->
@@ -204,6 +241,7 @@ const RATING_COLOR = { Sell:"#f43f5e", Underweight:"#fb923c", Hold:"#94a3b8", Ov
 const $ = (id) => document.getElementById(id);
 let plannedNodes = [], nodeEls = {}, cardEls = {}, sectionEls = {};
 let activeES = null, t0 = 0, timerInt = null, currentParams = null;
+let marketChartEl = null;  // chart container kept for PDF export
 
 function tint(hex, a){ return hex + Math.round(a*255).toString(16).padStart(2,"0"); }
 function avatarTile(icon, color, size){
@@ -400,6 +438,7 @@ function renderChart(container, d){
   charts.forEach(sync);
   const ro=new ResizeObserver(()=>{ const w=container.clientWidth||640; charts.forEach(c=>c.applyOptions({width:w})); });
   ro.observe(container);
+  container.__charts=charts; marketChartEl=container;  // expose for PDF export
 }
 
 // ── verdict ───────────────────────────────────────────────────────────────
@@ -425,7 +464,7 @@ function handleEvent(ev){
       break;
     case "final": showVerdict(ev.decision,ev.content); break;
     case "error": statusPill("error","#f43f5e"); showError(ev.message); break;
-    case "done": statusPill("complete","#34d399"); stopTimer(); $("run-btn").disabled=false; $("new-run").disabled=false; if(activeES) activeES.close(); break;
+    case "done": statusPill("complete","#34d399"); stopTimer(); $("run-btn").disabled=false; $("new-run").disabled=false; $("download-pdf").classList.remove("hidden"); if(activeES) activeES.close(); break;
   }
 }
 function showError(msg){
@@ -438,7 +477,8 @@ function resetUI(){
   $("stages").innerHTML=""; $("identity").classList.add("hidden"); $("identity").textContent="";
   $("verdict-rationale").classList.add("hidden"); $("verdict-toggle").classList.add("hidden");
   $("cache-banner").classList.add("hidden"); $("cache-banner").style.display="none";
-  cardEls={}; sectionEls={}; $("empty").classList.add("hidden");
+  cardEls={}; sectionEls={}; marketChartEl=null; $("empty").classList.add("hidden");
+  $("download-pdf").classList.add("hidden");
 }
 
 // ── cached render (60-minute cache hit) ─────────────────────────────────────
@@ -460,7 +500,7 @@ function renderCached(run){
   showVerdict(run.decision||"Hold", run.final_content||"");
   showCacheBanner(run.created_at);
   statusPill("from cache","#38bdf8"); stopTimer();
-  $("run-btn").disabled=false; $("new-run").disabled=false;
+  $("run-btn").disabled=false; $("new-run").disabled=false; $("download-pdf").classList.remove("hidden");
 }
 
 $("new-run").onclick=()=>{ $("run-form").classList.remove("hidden"); $("run-summary").classList.add("hidden"); };
@@ -496,6 +536,146 @@ async function startRun(force){
 }
 
 $("run-form").addEventListener("submit",(e)=>{ e.preventDefault(); startRun(false); });
+
+// ── PDF export ──────────────────────────────────────────────────────────────
+function esc(s){ const d=document.createElement("div"); d.textContent=s||""; return d.innerHTML; }
+
+// Stitch the live Lightweight Charts panes into a single white-background PNG.
+function chartImageDataURL(){
+  const el=marketChartEl;
+  if(!el || !el.__charts || !el.__charts.length || !el.__charts[0].takeScreenshot) return null;
+  try{
+    const shots=el.__charts.map(c=>c.takeScreenshot());
+    const w=Math.max(...shots.map(s=>s.width));
+    const h=shots.reduce((a,s)=>a+s.height,0);
+    if(!w || !h) return null;
+    const cv=document.createElement("canvas"); cv.width=w; cv.height=h;
+    const ctx=cv.getContext("2d");
+    ctx.fillStyle="#ffffff"; ctx.fillRect(0,0,w,h);
+    let y=0; shots.forEach(s=>{ ctx.drawImage(s,0,y); y+=s.height; });
+    return cv.toDataURL("image/png");
+  }catch(e){ return null; }
+}
+
+// Build the export DOM as a flat list of `.pdf-block` elements. Each block is
+// rasterized to its own canvas at export time, so we never build one giant
+// canvas that would blow past the browser's ~65k-px canvas limit (which is what
+// produced blank multi-page PDFs).
+function buildExportRoot(){
+  const root=document.createElement("div"); root.className="pdf-export feed-md";
+  const p=currentParams||{};
+  const word=$("verdict-word").textContent||"—";
+  const color=RATING_COLOR[word]||"#0f172a";
+
+  let head=`<div class="pdf-block">
+    <h1 class="pdf-title">StockAgents — AI investment desk</h1>
+    <div class="pdf-meta">${esc(p.ticker||"")} · ${esc(p.trade_date||"")} · ${esc((p.asset_type||"stock"))} · generated ${esc(new Date().toLocaleString())}</div>
+    <hr class="pdf-rule" />
+    <div class="pdf-verdict"><span class="pdf-verdict-label">Verdict</span>
+      <span class="pdf-verdict-word" style="color:${color}">${esc(word)}</span></div>`;
+  const rationale=$("verdict-rationale");
+  if(rationale && rationale.innerHTML.trim()){
+    head+=`<div class="feed-md" style="font-size:13px">${rationale.innerHTML}</div>`;
+  }
+  head+=`</div>`;
+  let html=head;
+
+  const identity=$("identity");
+  if(identity && !identity.classList.contains("hidden") && identity.textContent.trim()){
+    html+=`<div class="pdf-block"><div class="pdf-identity">${esc(identity.textContent)}</div></div>`;
+  }
+
+  const chartImg=chartImageDataURL();
+  let lastStage=null;
+  plannedNodes.forEach(node=>{
+    const card=cardEls[node]; if(!card) return;
+    const m=NODE[node]||{icon:"•",blurb:"",stage:""};
+    if(m.stage!==lastStage){
+      const s=STAGES.find(x=>x.key===m.stage);
+      html+=`<div class="pdf-block"><div class="pdf-stage">${s?esc(s.icon+" "+s.label):esc(m.stage)}</div></div>`;
+      lastStage=m.stage;
+    }
+    const body=card.querySelector("[data-body]");
+    const bodyHTML=(body && body.innerHTML.trim()) ? body.innerHTML : `<p style="color:#94a3b8;font-style:italic">No textual output.</p>`;
+    let block=`<div class="pdf-block"><div class="pdf-card">
+      <div class="pdf-card-head">${esc(m.icon)} ${esc(node)}<span class="pdf-card-blurb">${esc(m.blurb||"")}</span></div>
+      <div class="feed-md">${bodyHTML}</div>`;
+    if(node==="Market Analyst" && chartImg){
+      block+=`<div class="pdf-chart"><img src="${chartImg}" alt="Price chart" /></div>`;
+    }
+    block+=`</div></div>`;
+    html+=block;
+  });
+
+  root.innerHTML=html;
+  return root;
+}
+
+async function downloadPDF(){
+  if(!currentParams || !window.html2canvas || !(window.jspdf && window.jspdf.jsPDF)) return;
+  const btn=$("download-pdf"); const label=btn.textContent;
+  btn.disabled=true; btn.textContent="Preparing…";
+  let holder=null;
+  try{
+    const root=buildExportRoot();
+    holder=document.createElement("div"); holder.className="pdf-holder";
+    holder.appendChild(root);
+    document.body.appendChild(holder);
+
+    const { jsPDF }=window.jspdf;
+    const pdf=new jsPDF({unit:"mm",format:"a4",orientation:"portrait"});
+    const pageW=pdf.internal.pageSize.getWidth();
+    const pageH=pdf.internal.pageSize.getHeight();
+    const margin=12;
+    const contentW=pageW-margin*2;
+    const contentH=pageH-margin*2;
+    let cursorY=margin;
+    let firstPage=true;
+
+    const blocks=root.querySelectorAll(".pdf-block");
+    for(const block of blocks){
+      const canvas=await html2canvas(block,{scale:2,backgroundColor:"#ffffff",useCORS:true,logging:false});
+      if(!canvas.width || !canvas.height) continue;
+      const pxPerMm=canvas.width/contentW;     // canvas px that map to 1mm of page width
+      const blockHmm=canvas.height/pxPerMm;     // full block height in mm
+
+      if(blockHmm<=contentH){
+        // Block fits on a page; place it, starting a new page if it won't fit.
+        if(!firstPage && cursorY+blockHmm>margin+contentH){ pdf.addPage(); cursorY=margin; }
+        pdf.addImage(canvas.toDataURL("image/jpeg",0.95),"JPEG",margin,cursorY,contentW,blockHmm,undefined,"FAST");
+        cursorY+=blockHmm+3;
+      } else {
+        // Block taller than a page: slice the canvas into page-height chunks.
+        const sliceHpx=Math.floor(contentH*pxPerMm);
+        let sy=0;
+        while(sy<canvas.height){
+          const sH=Math.min(sliceHpx,canvas.height-sy);
+          const slice=document.createElement("canvas");
+          slice.width=canvas.width; slice.height=sH;
+          slice.getContext("2d").drawImage(canvas,0,sy,canvas.width,sH,0,0,canvas.width,sH);
+          if(!firstPage){ pdf.addPage(); }
+          firstPage=false;
+          const sHmm=sH/pxPerMm;
+          pdf.addImage(slice.toDataURL("image/jpeg",0.95),"JPEG",margin,margin,contentW,sHmm,undefined,"FAST");
+          cursorY=margin+sHmm+3;
+          sy+=sH;
+        }
+        continue;
+      }
+      firstPage=false;
+    }
+
+    const p=currentParams||{};
+    const fname=`StockAgents_${(p.ticker||"report")}_${(p.trade_date||"")}.pdf`.replace(/[^\w.\-]+/g,"_");
+    pdf.save(fname);
+  }catch(e){
+    statusPill("PDF failed","#f43f5e");
+  }finally{
+    if(holder) holder.remove();
+    btn.disabled=false; btn.textContent=label;
+  }
+}
+$("download-pdf").onclick=downloadPDF;
 
 // ── admin panel ─────────────────────────────────────────────────────────────
 let adminPw="";
