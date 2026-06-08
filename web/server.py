@@ -533,27 +533,6 @@ def _graph_payload(analysts: str, max_debate_rounds: int, max_risk_rounds: int, 
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/api/graph/live")
-def get_graph_live(
-    analysts: str = "market,social,news,fundamentals",
-    max_debate_rounds: int = DEFAULT_CONFIG["max_debate_rounds"],
-    max_risk_rounds: int = DEFAULT_CONFIG["max_risk_discuss_rounds"],
-) -> dict:
-    """Collapsed agent graph for the live runner (open).
-
-    Returns only the structural nodes/edges already shown on the public home
-    page — none of the gated blueprint detail (internal nodes, memory, data
-    sources, tool matrix)."""
-    bp = _graph_payload(analysts, max_debate_rounds, max_risk_rounds, include_internal=False)
-    return {
-        "nodes": bp["nodes"],
-        "edges": bp["edges"],
-        "legend": bp["legend"],
-        "selected_analysts": bp["selected_analysts"],
-        "stats": bp["stats"],
-    }
-
-
 @app.get("/api/graph/blueprint")
 async def get_graph_blueprint(
     analysts: str = "market,social,news,fundamentals",

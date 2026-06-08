@@ -9,8 +9,6 @@
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-  <script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
-  <script src="/static/graph.js"></script>
   <script>tailwind.config = { darkMode: "class" };</script>
   <style>
     :root { color-scheme: dark; }
@@ -34,8 +32,6 @@
     .feed-md strong{color:#e2e8f0;font-weight:600;} .feed-md a{color:#60a5fa;text-decoration:underline;}
     .feed-md blockquote{border-left:3px solid #475569;padding-left:.8em;color:#94a3b8;margin:.5em 0;}
     .scroll-body{max-height:340px;overflow:auto;} .scroll-body::-webkit-scrollbar{width:8px;} .scroll-body::-webkit-scrollbar-thumb{background:#334155;border-radius:8px;}
-    #live-cy{width:100%;height:280px;background:transparent;}
-    @media(min-width:768px){#live-cy{height:320px;}}
 
     /* ── Light, print-friendly layout used only for the PDF export ─────────── */
     .pdf-holder{position:absolute;left:-9999px;top:0;pointer-events:none;}
@@ -199,29 +195,6 @@
   <!-- ░░ Identity ░░ -->
   <div id="identity" class="hidden bg-slate-900/50 border border-slate-800 rounded-xl px-4 py-2.5 mb-5 text-xs text-slate-400 whitespace-pre-wrap font-mono leading-relaxed"></div>
 
-  <!-- ░░ Live agent graph ░░ -->
-  <section id="graph-wrap" class="hidden bg-slate-900/50 border border-slate-800 rounded-xl mb-6 overflow-hidden">
-    <div class="flex items-center justify-between px-4 py-2 border-b border-slate-800/80">
-      <div class="flex items-center gap-2">
-        <span class="text-sm font-semibold text-sky-300">Live agent graph</span>
-        <span class="text-[10px] text-slate-500">agents + purple memory flow during the run</span>
-      </div>
-      <div class="flex items-center gap-2">
-        <button id="graph-fit" type="button" class="text-[10px] px-2 py-1 rounded border border-slate-700 text-slate-400 hover:text-slate-200">Fit</button>
-        <a href="/blueprint" data-blueprint-link target="_blank" rel="noopener" class="text-[10px] px-2 py-1 rounded border border-slate-700 text-slate-400 hover:text-sky-300">Full blueprint ↗</a>
-      </div>
-    </div>
-    <div id="memory-status" class="hidden px-4 py-1.5 text-[10px] text-purple-300/90 border-b border-purple-500/20 bg-purple-950/20 flex items-center gap-2">
-      <span class="w-1.5 h-1.5 rounded-full bg-purple-400 pulse-dot"></span>
-      <span id="memory-status-text">Memory</span>
-    </div>
-    <div class="relative">
-      <div id="live-cy"></div>
-      <div id="pipeline" class="hidden"></div>
-    </div>
-    <div id="graph-detail" class="hidden px-4 py-2 pb-3 text-xs text-slate-400 border-t border-slate-800/60"></div>
-  </section>
-
   <!-- ░░ Stage feed ░░ -->
   <div id="stages" class="space-y-7"></div>
 
@@ -307,7 +280,6 @@ let plannedNodes = [], nodeEls = {}, cardEls = {}, sectionEls = {};
 let activeES = null, t0 = 0, timerInt = null, currentParams = null;
 let marketChartEl = null;  // chart container kept for PDF export
 let usageByNode = {}, usageTotals = null;  // run economics (tokens + est. cost)
-let liveCy = null, graphBlueprint = null;
 let activeRunId = null;  // current run id, mirrored into blueprint links for live watch
 const SESSION_KEY = "stockagents_active_run";
 
@@ -394,7 +366,6 @@ async function tryRestoreActiveRun(){
     $("run-btn").dataset.finished="1";
   }
 
-  await loadLiveGraph(state.analysts||["market","social","news","fundamentals"]);
   connectEventSource(state.run_id);
 }
 
@@ -460,40 +431,17 @@ function refreshStepper(){
   });
 }
 
-// ── live agent graph (Cytoscape) ───────────────────────────────────────────
-async function loadLiveGraph(analysts){
-  const debate=parseInt($("max_debate_rounds").value)||1;
-  const risk=parseInt($("max_risk_rounds").value)||1;
-  const q=new URLSearchParams({analysts:analysts.join(","),max_debate_rounds:debate,max_risk_rounds:risk});
-  try{
-    const res=await fetch(`/api/graph/live?${q}`);
-    if(!res.ok) return;
-    graphBlueprint=await res.json();
-    $("graph-wrap").classList.remove("hidden");
-    const container=$("live-cy");
-    if(liveCy) liveCy.destroy();
-    liveCy=TAGraph.createGraph(container, graphBlueprint, {
-      showInternal:false,
-      liveMode:true,
-      onNodeSelect(data){
-        const panel=$("graph-detail");
-        panel.classList.remove("hidden");
-        TAGraph.renderDetailPanel(panel, data);
-      },
-    });
-  }catch(e){ console.warn("graph load failed", e); }
-}
+// ── pipeline progress (stepper) ─────────────────────────────────────────────
 function buildPipeline(nodes){
   plannedNodes=nodes; nodeEls={};
   nodes.forEach(n=>{ nodeEls[n]={ dataset:{ state:"pending", node:n } }; });
 }
 function setNodeState(n,state){
   if(nodeEls[n]) nodeEls[n].dataset.state=state;
-  if(liveCy) TAGraph.setNodeState(liveCy, n, state);
   refreshStepper();
 }
 
-/** Keep the live graph in sync even when a prior agent never emitted "done". */
+/** Keep the stepper in sync even when a prior agent never emitted "done". */
 function applyGraphProgress(ev){
   if(!plannedNodes.length || !ev) return;
   const completed=ev.completed || [];
@@ -502,8 +450,6 @@ function applyGraphProgress(ev){
     setNodeState(ev.active, completed.includes(ev.active) ? "done" : "running");
   }
 }
-
-$("graph-fit").onclick=()=> liveCy && liveCy.fit(undefined, 40);
 
 // ── stage feed ────────────────────────────────────────────────────────────
 function section(stageKey){
@@ -704,59 +650,16 @@ function showVerdict(decision,content){
   }
 }
 
-const MEMORY_STATUS = {
-  resolve: { start: "Resolving pending outcomes from prior runs…", done: (ev) => ev.resolved ? `Resolved ${ev.resolved} prior decision(s) with market returns` : "No pending outcomes to resolve yet" },
-  identity: { done: "Instrument identity grounded for all agents" },
-  inject: { _: (ev) => ev.has_context ? "Past lessons injected → Portfolio Manager (past_context)" : "No prior lessons for this ticker — fresh analysis" },
-  consume: { _: "Portfolio Manager reading past_context from memory log" },
-  store: { done: "Decision stored to memory log (pending until next run)" },
-};
-
-function showMemoryStatus(text){
-  const bar=$("memory-status"), txt=$("memory-status-text");
-  if(!text){ bar.classList.add("hidden"); return; }
-  bar.classList.remove("hidden"); txt.textContent=text;
-}
-
-function handleMemoryEvent(ev){
-  if(!liveCy) return;
-  const phase=ev.phase;
-  if(phase==="resolve" && ev.status==="start"){ TAGraph.setMemoryPhase(liveCy,"resolve"); showMemoryStatus(MEMORY_STATUS.resolve.start); return; }
-  if(phase==="resolve" && ev.status==="done"){
-    TAGraph.clearMemoryFlow(liveCy);
-    const msg=typeof MEMORY_STATUS.resolve.done==="function"?MEMORY_STATUS.resolve.done(ev):MEMORY_STATUS.resolve.done;
-    showMemoryStatus(msg);
-    return;
-  }
-  if(phase==="identity"){ TAGraph.setMemoryPhase(liveCy,"identity"); showMemoryStatus(MEMORY_STATUS.identity.done); return; }
-  if(phase==="inject"){
-    TAGraph.setMemoryPhase(liveCy,"inject");
-    showMemoryStatus(MEMORY_STATUS.inject._(ev));
-    return;
-  }
-  if(phase==="store" && ev.status==="done"){
-    TAGraph.setMemoryPhase(liveCy,"store");
-    showMemoryStatus(MEMORY_STATUS.store.done);
-    setTimeout(()=>{ TAGraph.clearMemoryFlow(liveCy); showMemoryStatus(""); }, 4000);
-  }
-}
-
 // ── event handling ──────────────────────────────────────────────────────────
 function handleEvent(ev){
   switch(ev.type){
     case "nodes": buildPipeline(ev.nodes); buildStepper(); if(ev.nodes.length) setNodeState(ev.nodes[0],"running"); break;
-    case "graph":
-      if(liveCy && ev.node) TAGraph.pulseToolActivity(liveCy, ev.node);
-      break;
-    case "memory": handleMemoryEvent(ev); break;
+    case "graph": break;
+    case "memory": break;
     case "progress": applyGraphProgress(ev); break;
     case "status": statusPill(ev.message,"#fbbf24"); $("verdict-sub").textContent=ev.message; break;
     case "identity": $("identity").classList.remove("hidden"); $("identity").textContent=ev.content; break;
     case "agent":
-      if(ev.node==="Portfolio Manager" && ev.status==="running"){
-        TAGraph.setMemoryPhase(liveCy,"consume");
-        showMemoryStatus(MEMORY_STATUS.consume._);
-      }
       if(ev.status==="running"){ feedCard(ev.node); }
       else { updateCard(ev.node,{status:"done",content:ev.content}); }
       break;
@@ -784,9 +687,6 @@ function resetUI(){
   cardEls={}; sectionEls={}; marketChartEl=null; $("empty").classList.add("hidden");
   $("download-pdf").classList.add("hidden");
   usageByNode={}; usageTotals=null; $("economics").classList.add("hidden");
-  if(liveCy){ TAGraph.clearNodeStates(liveCy); }
-  $("graph-detail").classList.add("hidden"); $("graph-detail").innerHTML="";
-  showMemoryStatus("");
 }
 
 // ── cached render (60-minute cache hit) ─────────────────────────────────────
@@ -802,14 +702,8 @@ function renderCached(run){
   const nodes=[]; agents.forEach(a=>{ if(!nodes.includes(a.agent)) nodes.push(a.agent); });
   const selAnalysts=nodes.filter(n=>NODE[n]?.stage==="Analysis").length;
   $("run-summary-text").textContent=runSummaryLabel(run.ticker, run.trade_date, selAnalysts, nodes.length);
-  const cachedAnalysts=nodes.filter(n=>NODE[n]?.stage==="Analysis").map(n=>{
-    const m={"Market Analyst":"market","Sentiment Analyst":"social","News Analyst":"news","Fundamentals Analyst":"fundamentals"};
-    return m[n];
-  }).filter(Boolean);
-  loadLiveGraph(cachedAnalysts.length?cachedAnalysts:["market","social","news","fundamentals"]).then(()=>{
-    buildPipeline(nodes); buildStepper();
-    nodes.forEach(n=>setNodeState(n,"done"));
-  });
+  buildPipeline(nodes); buildStepper();
+  nodes.forEach(n=>setNodeState(n,"done"));
   if(run.identity){ $("identity").classList.remove("hidden"); $("identity").textContent=run.identity; }
   agents.forEach(a=>updateCard(a.agent,{status:"done",content:a.content}));
   $("verdict").classList.remove("hidden");
@@ -857,7 +751,6 @@ async function startRun(force){
   activeRunId=data.run_id;
   saveActiveRun({...body, run_id:data.run_id});
   updateBlueprintLinks();
-  await loadLiveGraph(analysts);
   startTimer();
   connectEventSource(data.run_id);
 }
