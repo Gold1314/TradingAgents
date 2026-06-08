@@ -692,19 +692,33 @@ def run_status(run_id: str) -> dict:
 
 
 @app.get("/api/runs/{run_id}/events")
-async def run_events(run_id: str) -> StreamingResponse:
+async def run_events(run_id: str, request: Request) -> StreamingResponse:
     run = manager.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="unknown or expired run")
 
+    # Resume from the client's last-seen event index. EventSource auto-reconnect
+    # sends Last-Event-ID, so a dropped connection (tab backgrounded, network
+    # blip) picks up exactly where it left off instead of replaying or losing
+    # events. A fresh connection (no header) replays from the start — which is
+    # what a page reload / session-restore wants.
+    last_id = request.headers.get("last-event-id")
+    start = 0
+    if last_id:
+        try:
+            start = max(0, int(last_id) + 1)
+        except ValueError:
+            start = 0
+
     async def event_stream():
-        cursor = 0
+        cursor = start
         while True:
             while cursor < len(run.event_log):
                 event = run.event_log[cursor]
-                yield f"data: {json.dumps(event)}\n\n"
+                yield f"id: {cursor}\ndata: {json.dumps(event)}\n\n"
+                is_done = event.get("type") == "done"
                 cursor += 1
-                if event.get("type") == "done":
+                if is_done:
                     return
             if run.done.is_set():
                 return

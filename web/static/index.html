@@ -322,13 +322,25 @@ function connectEventSource(runId){
   if(activeES) activeES.close();
   activeES=new EventSource(`/api/runs/${runId}/events`);
   activeES.onmessage=(m)=>{ if(m.data) handleEvent(JSON.parse(m.data)); };
+  activeES.onopen=()=>{
+    // Re-established after a drop (e.g. returning from the Blueprint tab): the
+    // run kept going server-side, so just resume showing live progress.
+    if($("run-btn").disabled && !$("run-btn").dataset.finished){ statusPill("running…","#fbbf24"); }
+  };
   activeES.onerror=()=>{
-    if($("run-btn").disabled && !$("run-btn").dataset.finished){
-      statusPill("connection lost","#f43f5e");
-      stopTimer();
-      $("run-btn").disabled=false;
-      $("new-run").disabled=false;
+    if($("run-btn").dataset.finished) return;               // run already complete
+    // The run lives in a detached server thread, independent of this connection.
+    // A transient drop leaves EventSource in CONNECTING while it auto-reconnects
+    // (resuming via Last-Event-ID) — keep waiting rather than ending the run.
+    if(activeES && activeES.readyState===EventSource.CONNECTING){
+      statusPill("reconnecting…","#fbbf24");
+      return;
     }
+    // CLOSED: fatal (e.g. run expired or 404) — stop cleanly so the user can retry.
+    statusPill("connection lost","#f43f5e");
+    stopTimer();
+    $("run-btn").disabled=false;
+    $("new-run").disabled=false;
     if(activeES) activeES.close();
   };
 }
