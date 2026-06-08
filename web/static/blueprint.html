@@ -27,8 +27,8 @@
       <div class="flex items-center gap-3 mb-4">
         <div class="w-10 h-10 rounded-lg bg-gradient-to-br from-emerald-400 to-sky-500 flex items-center justify-center text-xl">🗺️</div>
         <div>
-          <h2 class="text-lg font-bold text-white">Unlock the Agent Blueprint</h2>
-          <p class="text-[11px] text-slate-400">Enter your email to view the interactive LangGraph topology.</p>
+          <h2 class="text-lg font-bold text-white">Restricted — Agent Blueprint</h2>
+          <p class="text-[11px] text-slate-400">Enter your authorized email to view the interactive LangGraph topology.</p>
         </div>
       </div>
       <form id="email-form" class="space-y-3">
@@ -39,7 +39,7 @@
           class="w-full px-4 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-sm transition disabled:opacity-60">
           View blueprint →
         </button>
-        <p class="text-[10px] text-slate-600 text-center">We store your email to understand who's using the tool. No spam.</p>
+        <p class="text-[10px] text-slate-600 text-center">Access is limited to approved emails. Contact the admin to be added.</p>
       </form>
     </div>
   </div>
@@ -223,6 +223,7 @@ async function loadBlueprint() {
     max_debate_rounds: debate,
     max_risk_rounds: risk,
     include_internal: showInternal ? "1" : "0",
+    token: blueprintToken || "",
   });
   let res;
   try {
@@ -231,6 +232,13 @@ async function loadBlueprint() {
     errEl.textContent = "Could not reach the server. Is uvicorn running?";
     errEl.style.display = "flex";
     loading.style.display = "none";
+    return;
+  }
+  if (res.status === 403) {
+    // Token missing/expired or email no longer allowlisted — re-gate.
+    loading.style.display = "none";
+    forgetToken();
+    showEmailGate("Your access has expired or this email is no longer authorized. Enter an authorized email.");
     return;
   }
   if (!res.ok) {
@@ -434,9 +442,27 @@ function initBlueprint() {
   loadBlueprint();
 }
 
-// ── Email gate (one-time per browser, stored in localStorage) ─────────────────
-const EMAIL_KEY = "stockagents_blueprint_email";
+// ── Email gate (allowlist-only; server-enforced via signed token) ─────────────
+const TOKEN_KEY = "stockagents_blueprint_token";
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+let blueprintToken = null;
+try { blueprintToken = localStorage.getItem(TOKEN_KEY); } catch (e) {}
+
+function forgetToken() {
+  blueprintToken = null;
+  try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
+}
+
+function showEmailGate(message) {
+  const gate = document.getElementById("email-gate");
+  const errEl = document.getElementById("email-error");
+  gate.classList.remove("hidden");
+  if (message) { errEl.textContent = message; errEl.classList.remove("hidden"); }
+  else { errEl.classList.add("hidden"); }
+  const btn = document.getElementById("email-submit");
+  btn.disabled = false; btn.textContent = "View blueprint →";
+  document.getElementById("email-input").focus();
+}
 
 document.getElementById("email-form").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -450,38 +476,44 @@ document.getElementById("email-form").addEventListener("submit", async (e) => {
     errEl.classList.remove("hidden");
     return;
   }
-  btn.disabled = true; btn.textContent = "Unlocking…";
+  btn.disabled = true; btn.textContent = "Checking…";
   const analysts = new URLSearchParams(window.location.search).get("analysts") || null;
+  let data = null;
   try {
     const res = await fetch("/api/blueprint/access", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, analysts }),
     });
-    if (!res.ok) {
-      const d = await res.json().catch(() => ({}));
-      errEl.textContent = d.detail || "Could not verify that email.";
+    data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.token) {
+      // Fail-closed: only allowlisted emails are granted a token.
+      errEl.textContent = data.detail || (res.status === 403
+        ? "This email is not authorized for the blueprint."
+        : "Could not verify that email.");
       errEl.classList.remove("hidden");
       btn.disabled = false; btn.textContent = "View blueprint →";
       return;
     }
   } catch (e2) {
-    // Fail-open: network hiccup shouldn't lock a user out of a read-only view.
+    errEl.textContent = "Could not reach the server. Try again.";
+    errEl.classList.remove("hidden");
+    btn.disabled = false; btn.textContent = "View blueprint →";
+    return;
   }
-  try { localStorage.setItem(EMAIL_KEY, email); } catch (e3) {}
+  blueprintToken = data.token;
+  try { localStorage.setItem(TOKEN_KEY, data.token); } catch (e3) {}
   document.getElementById("email-gate").classList.add("hidden");
   initBlueprint();
 });
 
 (function bootstrap() {
-  let saved = null;
-  try { saved = localStorage.getItem(EMAIL_KEY); } catch (e) {}
-  if (saved && EMAIL_RE.test(saved)) {
+  if (blueprintToken) {
+    // Optimistically render; loadBlueprint() re-gates on a 403 from the API.
     document.getElementById("email-gate").classList.add("hidden");
     initBlueprint();
   } else {
-    document.getElementById("email-gate").classList.remove("hidden");
-    document.getElementById("email-input").focus();
+    showEmailGate();
   }
 })();
 </script>

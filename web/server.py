@@ -19,6 +19,9 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -469,14 +472,53 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
 app = FastAPI(title="StockAgents")
 
 
-@app.get("/api/graph/blueprint")
-def get_graph_blueprint(
-    analysts: str = "market,social,news,fundamentals",
-    max_debate_rounds: int = DEFAULT_CONFIG["max_debate_rounds"],
-    max_risk_rounds: int = DEFAULT_CONFIG["max_risk_discuss_rounds"],
-    include_internal: int = 1,
-) -> dict:
-    """LangGraph topology for the interactive web graph visualizer."""
+# Loose RFC-5322-ish check; intentionally permissive (we only gate access, we
+# don't verify deliverability). Avoids pulling in the email-validator dependency.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# ── blueprint access tokens (allowlist-gated, fail-closed) ─────────────────────
+BLUEPRINT_TOKEN_TTL = 7 * 24 * 3600  # 7 days
+
+
+def _blueprint_secret() -> Optional[str]:
+    """Server-side signing secret for blueprint tokens.
+
+    Prefers an explicit secret; falls back to the Supabase service key (already
+    secret and stable across restarts). Returns None when nothing is available,
+    in which case access is denied (fail-closed)."""
+    return (
+        os.environ.get("STOCKAGENTS_BLUEPRINT_SECRET")
+        or os.environ.get("SUPABASE_KEY")
+        or os.environ.get("STOCKAGENTS_ADMIN_PASSWORD")
+        or None
+    )
+
+
+def _mint_blueprint_token(email: str, secret: str, ttl: int = BLUEPRINT_TOKEN_TTL) -> str:
+    exp = int(time.time()) + ttl
+    msg = f"{email}|{exp}"
+    sig = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{msg}|{sig}".encode()).decode()
+
+
+def _verify_blueprint_token(token: str, secret: str) -> Optional[str]:
+    """Return the email embedded in a valid, unexpired token, else None."""
+    if not token or not secret:
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        email, exp, sig = raw.rsplit("|", 2)
+        expected = hmac.new(secret.encode(), f"{email}|{exp}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        if int(exp) < int(time.time()):
+            return None
+        return email
+    except Exception:  # noqa: BLE001 — any malformed token is simply invalid
+        return None
+
+
+def _graph_payload(analysts: str, max_debate_rounds: int, max_risk_rounds: int, include_internal: bool) -> dict:
     selected = [a.strip() for a in analysts.split(",") if a.strip()]
     if not selected:
         raise HTTPException(status_code=400, detail="select at least one analyst")
@@ -485,20 +527,59 @@ def get_graph_blueprint(
             selected_analysts=selected,
             max_debate_rounds=max(1, max_debate_rounds),
             max_risk_rounds=max(1, max_risk_rounds),
-            include_internal=bool(include_internal),
+            include_internal=include_internal,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/graph/live")
+def get_graph_live(
+    analysts: str = "market,social,news,fundamentals",
+    max_debate_rounds: int = DEFAULT_CONFIG["max_debate_rounds"],
+    max_risk_rounds: int = DEFAULT_CONFIG["max_risk_discuss_rounds"],
+) -> dict:
+    """Collapsed agent graph for the live runner (open).
+
+    Returns only the structural nodes/edges already shown on the public home
+    page — none of the gated blueprint detail (internal nodes, memory, data
+    sources, tool matrix)."""
+    bp = _graph_payload(analysts, max_debate_rounds, max_risk_rounds, include_internal=False)
+    return {
+        "nodes": bp["nodes"],
+        "edges": bp["edges"],
+        "legend": bp["legend"],
+        "selected_analysts": bp["selected_analysts"],
+        "stats": bp["stats"],
+    }
+
+
+@app.get("/api/graph/blueprint")
+async def get_graph_blueprint(
+    analysts: str = "market,social,news,fundamentals",
+    max_debate_rounds: int = DEFAULT_CONFIG["max_debate_rounds"],
+    max_risk_rounds: int = DEFAULT_CONFIG["max_risk_discuss_rounds"],
+    include_internal: int = 1,
+    token: str = "",
+) -> dict:
+    """Full LangGraph blueprint — gated to allowlisted emails (fail-closed).
+
+    Requires a valid token from /api/blueprint/access AND re-checks that the
+    token's email is still on the allowlist, so removing a row revokes access."""
+    secret = _blueprint_secret()
+    email = _verify_blueprint_token(token, secret) if secret else None
+    if not email:
+        raise HTTPException(status_code=403, detail="blueprint access requires a verified email")
+    loop = asyncio.get_running_loop()
+    allowed = await loop.run_in_executor(None, db.is_blueprint_email_allowed, email)
+    if allowed is not True:  # False (removed) or None (cannot verify) → deny
+        raise HTTPException(status_code=403, detail="this email is no longer authorized")
+    return _graph_payload(analysts, max_debate_rounds, max_risk_rounds, bool(include_internal))
+
+
 @app.get("/blueprint")
 def blueprint_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "blueprint.html")
-
-
-# Loose RFC-5322-ish check; intentionally permissive (we only gate access, we
-# don't verify deliverability). Avoids pulling in the email-validator dependency.
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class BlueprintAccess(BaseModel):
@@ -508,15 +589,23 @@ class BlueprintAccess(BaseModel):
 
 @app.post("/api/blueprint/access")
 async def blueprint_access(req: BlueprintAccess, request: Request) -> dict:
-    """Email gate for the blueprint. Validates format, best-effort persists the
-    email, and always unlocks access (storage is fail-open)."""
+    """Allowlist gate for the blueprint (fail-closed).
+
+    Grants access only when the email is already present in blueprint_leads.
+    The app never inserts — the allowlist is managed manually in Supabase. On
+    success, returns a signed token the client sends with blueprint requests."""
     email = (req.email or "").strip().lower()
     if not _EMAIL_RE.match(email) or len(email) > 254:
         raise HTTPException(status_code=400, detail="enter a valid email address")
+    secret = _blueprint_secret()
+    if not secret:
+        raise HTTPException(status_code=503, detail="blueprint access is not configured")
     loop = asyncio.get_running_loop()
-    meta = {"analysts": req.analysts, "user_agent": request.headers.get("user-agent")}
-    stored = await loop.run_in_executor(None, db.store_blueprint_email, email, meta)
-    return {"ok": True, "stored": stored}
+    allowed = await loop.run_in_executor(None, db.is_blueprint_email_allowed, email)
+    if allowed is not True:  # False (not listed) or None (cannot verify) → deny
+        raise HTTPException(status_code=403, detail="this email is not authorized for the blueprint")
+    token = _mint_blueprint_token(email, secret)
+    return {"ok": True, "token": token, "expires_in": BLUEPRINT_TOKEN_TTL}
 
 
 @app.get("/api/config")

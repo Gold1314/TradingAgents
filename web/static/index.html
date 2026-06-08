@@ -464,9 +464,9 @@ function refreshStepper(){
 async function loadLiveGraph(analysts){
   const debate=parseInt($("max_debate_rounds").value)||1;
   const risk=parseInt($("max_risk_rounds").value)||1;
-  const q=new URLSearchParams({analysts:analysts.join(","),max_debate_rounds:debate,max_risk_rounds:risk,include_internal:"0"});
+  const q=new URLSearchParams({analysts:analysts.join(","),max_debate_rounds:debate,max_risk_rounds:risk});
   try{
-    const res=await fetch(`/api/graph/blueprint?${q}`);
+    const res=await fetch(`/api/graph/live?${q}`);
     if(!res.ok) return;
     graphBlueprint=await res.json();
     $("graph-wrap").classList.remove("hidden");

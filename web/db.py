@@ -162,6 +162,31 @@ def get_recent_run(
         return None
 
 
+# ── blueprint access allowlist ─────────────────────────────────────────────────
+def is_blueprint_email_allowed(email: str) -> Optional[bool]:
+    """Whether an email is on the blueprint allowlist (blueprint_leads).
+
+    Returns True/False when Supabase answers, or **None** when access cannot be
+    verified (Supabase not configured or a query error). Callers must treat
+    None as deny (fail-closed) — this gate is an access restriction, not a
+    best-effort capture."""
+    client = _get_client()
+    if client is None:
+        return None
+    try:
+        res = (
+            client.table("blueprint_leads")
+            .select("email")
+            .eq("email", (email or "").strip().lower())
+            .limit(1)
+            .execute()
+        )
+        return bool(res.data)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("is_blueprint_email_allowed failed: %s", exc)
+        return None
+
+
 # ── blueprint email capture ───────────────────────────────────────────────────
 def store_blueprint_email(email: str, meta: Optional[Dict[str, Any]] = None) -> bool:
     """Record an email that unlocked the blueprint. Fail-open like the rest of db.
