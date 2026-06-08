@@ -22,7 +22,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
+import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
@@ -30,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -40,6 +42,8 @@ from tradingagents.graph.checkpointer import clear_checkpoint, thread_id
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from web import db
 from web.charts import build_chart_payload
+from web.graph_topology import build_graph_blueprint
+from web.usage import TokenUsageTracker
 
 logger = logging.getLogger("tradingagents.web")
 
@@ -108,13 +112,18 @@ class CacheToggle(BaseModel):
     enabled: bool
 
 
+RUN_RETENTION_SECONDS = 3600  # keep finished runs for replay / reconnect
+
+
 @dataclass
 class Run:
     run_id: str
-    queue: "asyncio.Queue[dict]"
+    queue: "asyncio.Queue[int]"
     loop: asyncio.AbstractEventLoop
     nodes: List[str]
+    event_log: List[dict] = field(default_factory=list)
     done: threading.Event = field(default_factory=threading.Event)
+    finished_at: Optional[float] = None
 
 
 class RunManager:
@@ -124,21 +133,36 @@ class RunManager:
         self._runs: Dict[str, Run] = {}
 
     def create(self, loop: asyncio.AbstractEventLoop, nodes: List[str]) -> Run:
+        self._prune_old_runs()
         run = Run(run_id=uuid.uuid4().hex, queue=asyncio.Queue(), loop=loop, nodes=nodes)
         self._runs[run.run_id] = run
         return run
 
     def get(self, run_id: str) -> Optional[Run]:
+        self._prune_old_runs()
         return self._runs.get(run_id)
 
     def emit(self, run: Run, event: dict) -> None:
-        """Thread-safe push of an event onto the run's asyncio queue."""
-        run.loop.call_soon_threadsafe(run.queue.put_nowait, event)
-
-    def finish(self, run_id: str) -> None:
-        run = self._runs.pop(run_id, None)
-        if run:
+        """Append to the replay log and wake any connected SSE consumer."""
+        run.event_log.append(event)
+        if event.get("type") == "done":
             run.done.set()
+            run.finished_at = time.time()
+
+        def _notify() -> None:
+            run.queue.put_nowait(len(run.event_log))
+
+        run.loop.call_soon_threadsafe(_notify)
+
+    def _prune_old_runs(self) -> None:
+        cutoff = time.time() - RUN_RETENTION_SECONDS
+        stale = [
+            rid
+            for rid, run in self._runs.items()
+            if run.finished_at is not None and run.finished_at < cutoff
+        ]
+        for rid in stale:
+            self._runs.pop(rid, None)
 
 
 manager = RunManager()
@@ -179,7 +203,7 @@ def _log_tool_calls(log_file: Optional[Path], node: str, delta: Any) -> None:
         logger.warning("could not write tool log: %s", exc)
 
 
-def _extract_event(node: str, delta: Any) -> Optional[dict]:
+def _extract_event(node: str, delta: Any, merged: Optional[Dict[str, Any]] = None) -> Optional[dict]:
     """Turn a LangGraph ``{node: delta}`` update into a UI event.
 
     Returns ``None`` for internal nodes the UI should ignore (message-clearing
@@ -196,6 +220,8 @@ def _extract_event(node: str, delta: Any) -> Optional[dict]:
     # Analyst nodes write a *_report; empty means it's still calling tools.
     if node in ("Market Analyst", "Sentiment Analyst", "News Analyst", "Fundamentals Analyst"):
         report = delta.get(REPORT_FIELD[node], "") or ""
+        if not report.strip() and merged:
+            report = merged.get(REPORT_FIELD[node], "") or ""
         if report.strip():
             return {"type": "agent", "node": node, "status": "done", "content": report}
         return {"type": "agent", "node": node, "status": "running", "content": None}
@@ -258,13 +284,39 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
 
         # Reflect on prior same-ticker runs (cross-run learning), best-effort.
         manager.emit(run, {"type": "status", "message": "Resolving identity & loading memory..."})
+        manager.emit(run, {"type": "memory", "phase": "resolve", "status": "start"})
+        pending_before = len(
+            [e for e in ta.memory_log.get_pending_entries() if e["ticker"] == req.ticker]
+        )
         try:
             ta._resolve_pending_entries(req.ticker)
         except Exception as exc:  # noqa: BLE001 — never block a run on memory I/O
             logger.warning("resolve_pending_entries failed: %s", exc)
+        pending_after = len(
+            [e for e in ta.memory_log.get_pending_entries() if e["ticker"] == req.ticker]
+        )
+        manager.emit(
+            run,
+            {
+                "type": "memory",
+                "phase": "resolve",
+                "status": "done",
+                "resolved": max(0, pending_before - pending_after),
+            },
+        )
 
         past_context = ta.memory_log.get_past_context(req.ticker)
+        manager.emit(
+            run,
+            {
+                "type": "memory",
+                "phase": "inject",
+                "has_context": bool((past_context or "").strip()),
+            },
+        )
+
         instrument_context = ta.resolve_instrument_context(req.ticker, req.asset_type)
+        manager.emit(run, {"type": "memory", "phase": "identity", "status": "done"})
         manager.emit(run, {"type": "identity", "content": instrument_context})
 
         init_state = ta.propagator.create_initial_state(
@@ -275,8 +327,12 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
             instrument_context=instrument_context,
         )
         # get_graph_args() bakes in stream_mode="values"; we want per-node
-        # deltas ("updates") so we can attribute output to each agent.
-        args = ta.propagator.get_graph_args()
+        # deltas ("updates") so we can attribute output to each agent. The token
+        # tracker is a graph-level callback: it sees every nested LLM call and
+        # attributes its (exact) token usage to the issuing node via the
+        # langgraph_node run metadata. Cost is estimated downstream.
+        usage = TokenUsageTracker()
+        args = ta.propagator.get_graph_args(callbacks=[usage])
         args.pop("stream_mode", None)
 
         checkpoint_enabled = bool(config.get("checkpoint_enabled"))
@@ -307,8 +363,17 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
                     merged.update(delta)
                 if node.startswith("tools_"):
                     _log_tool_calls(log_file, node, delta)
+                    manager.emit(
+                        run,
+                        {
+                            "type": "graph",
+                            "node": node,
+                            "status": "active",
+                            "tools": _tool_names(delta),
+                        },
+                    )
                     continue
-                event = _extract_event(node, delta)
+                event = _extract_event(node, delta, merged)
                 if event is not None:
                     if event["type"] == "agent" and event.get("status") == "done":
                         agent_outputs.append(
@@ -316,6 +381,35 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
                         )
                         seq += 1
                     manager.emit(run, event)
+                    if event["type"] == "agent":
+                        idx = run.nodes.index(event["node"]) if event["node"] in run.nodes else -1
+                        if idx >= 0:
+                            completed = run.nodes[: idx + 1] if event.get("status") == "done" else run.nodes[:idx]
+                            active = (
+                                run.nodes[idx + 1]
+                                if event.get("status") == "done" and idx + 1 < len(run.nodes)
+                                else event["node"]
+                            )
+                            manager.emit(
+                                run,
+                                {
+                                    "type": "progress",
+                                    "active": active,
+                                    "completed": completed,
+                                    "node": event["node"],
+                                    "status": event.get("status"),
+                                },
+                            )
+                    # Surface this node's token/cost the moment it finishes, so
+                    # the UI's economics panel fills in live alongside the feed.
+                    if event["type"] == "agent" and event.get("status") == "done":
+                        snapshot = usage.node_snapshot(event["node"])
+                        if snapshot:
+                            manager.emit(run, {"type": "usage", **snapshot})
+
+        # Authoritative end-of-run breakdown + totals (covers any node we didn't
+        # emit incrementally, e.g. an "Ungrouped" bucket).
+        manager.emit(run, {"type": "usage_summary", **usage.summary()})
 
         final_state = merged
         decision = ta.process_signal(final_state.get("final_trade_decision", ""))
@@ -328,6 +422,7 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
                 trade_date=req.trade_date,
                 final_trade_decision=final_state.get("final_trade_decision", ""),
             )
+            manager.emit(run, {"type": "memory", "phase": "store", "status": "done"})
         except Exception as exc:  # noqa: BLE001 — persistence must not fail the response
             logger.warning("persistence failed: %s", exc)
 
@@ -374,6 +469,56 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
 app = FastAPI(title="StockAgents")
 
 
+@app.get("/api/graph/blueprint")
+def get_graph_blueprint(
+    analysts: str = "market,social,news,fundamentals",
+    max_debate_rounds: int = DEFAULT_CONFIG["max_debate_rounds"],
+    max_risk_rounds: int = DEFAULT_CONFIG["max_risk_discuss_rounds"],
+    include_internal: int = 1,
+) -> dict:
+    """LangGraph topology for the interactive web graph visualizer."""
+    selected = [a.strip() for a in analysts.split(",") if a.strip()]
+    if not selected:
+        raise HTTPException(status_code=400, detail="select at least one analyst")
+    try:
+        return build_graph_blueprint(
+            selected_analysts=selected,
+            max_debate_rounds=max(1, max_debate_rounds),
+            max_risk_rounds=max(1, max_risk_rounds),
+            include_internal=bool(include_internal),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/blueprint")
+def blueprint_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "blueprint.html")
+
+
+# Loose RFC-5322-ish check; intentionally permissive (we only gate access, we
+# don't verify deliverability). Avoids pulling in the email-validator dependency.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class BlueprintAccess(BaseModel):
+    email: str
+    analysts: Optional[str] = None
+
+
+@app.post("/api/blueprint/access")
+async def blueprint_access(req: BlueprintAccess, request: Request) -> dict:
+    """Email gate for the blueprint. Validates format, best-effort persists the
+    email, and always unlocks access (storage is fail-open)."""
+    email = (req.email or "").strip().lower()
+    if not _EMAIL_RE.match(email) or len(email) > 254:
+        raise HTTPException(status_code=400, detail="enter a valid email address")
+    loop = asyncio.get_running_loop()
+    meta = {"analysts": req.analysts, "user_agent": request.headers.get("user-agent")}
+    stored = await loop.run_in_executor(None, db.store_blueprint_email, email, meta)
+    return {"ok": True, "stored": stored}
+
+
 @app.get("/api/config")
 def get_config() -> dict:
     """Defaults used to pre-fill the form."""
@@ -412,6 +557,7 @@ async def start_run(req: RunRequest) -> dict:
 
     nodes = _planned_nodes(req.analysts)
     run = manager.create(loop, nodes)
+    manager.emit(run, {"type": "nodes", "nodes": nodes})
 
     thread = threading.Thread(target=_run_pipeline, args=(run, req), daemon=True)
     thread.start()
@@ -462,28 +608,42 @@ def admin_set_cache(
     return {"cache_enabled": body.enabled}
 
 
+@app.get("/api/runs/{run_id}")
+def run_status(run_id: str) -> dict:
+    """Whether a run is still active or replayable (for session restore)."""
+    run = manager.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="unknown or expired run")
+    return {
+        "run_id": run_id,
+        "active": not run.done.is_set(),
+        "finished": run.done.is_set(),
+        "nodes": run.nodes,
+        "events": len(run.event_log),
+    }
+
+
 @app.get("/api/runs/{run_id}/events")
 async def run_events(run_id: str) -> StreamingResponse:
     run = manager.get(run_id)
     if run is None:
-        raise HTTPException(status_code=404, detail="unknown or completed run")
+        raise HTTPException(status_code=404, detail="unknown or expired run")
 
     async def event_stream():
-        # Tell the client which nodes to render in the pipeline graph.
-        yield f"data: {json.dumps({'type': 'nodes', 'nodes': run.nodes})}\n\n"
+        cursor = 0
         while True:
-            # A single agent (deep model) can run for minutes between events.
-            # Emit an SSE comment heartbeat on idle so proxies (Railway) don't
-            # drop the connection. EventSource ignores comment lines.
+            while cursor < len(run.event_log):
+                event = run.event_log[cursor]
+                yield f"data: {json.dumps(event)}\n\n"
+                cursor += 1
+                if event.get("type") == "done":
+                    return
+            if run.done.is_set():
+                return
             try:
-                event = await asyncio.wait_for(run.queue.get(), timeout=15)
+                await asyncio.wait_for(run.queue.get(), timeout=15)
             except asyncio.TimeoutError:
                 yield ": keepalive\n\n"
-                continue
-            yield f"data: {json.dumps(event)}\n\n"
-            if event.get("type") == "done":
-                break
-        manager.finish(run_id)
 
     return StreamingResponse(
         event_stream(),

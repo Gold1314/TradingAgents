@@ -50,8 +50,21 @@ insert into public.app_settings (key, value)
 values ('cache_enabled', 'true'::jsonb)
 on conflict (key) do nothing;
 
+-- One row per email captured by the blueprint access gate.
+create table if not exists public.blueprint_leads (
+    id         uuid primary key default gen_random_uuid(),
+    email      text not null,
+    analysts   text,              -- analysts selected when the gate was unlocked
+    user_agent text,
+    created_at timestamptz not null default now()
+);
+
+create index if not exists blueprint_leads_email_idx
+    on public.blueprint_leads (email, created_at desc);
+
 -- Enable RLS with no policies: denies anon/authenticated keys, while the
 -- backend's service_role key bypasses RLS and retains full access.
-alter table public.runs           enable row level security;
-alter table public.agent_outputs  enable row level security;
-alter table public.app_settings   enable row level security;
+alter table public.runs            enable row level security;
+alter table public.agent_outputs   enable row level security;
+alter table public.app_settings    enable row level security;
+alter table public.blueprint_leads enable row level security;

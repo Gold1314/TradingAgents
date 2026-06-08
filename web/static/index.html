@@ -9,6 +9,8 @@
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+  <script src="/static/graph.js"></script>
   <script>tailwind.config = { darkMode: "class" };</script>
   <style>
     :root { color-scheme: dark; }
@@ -32,6 +34,8 @@
     .feed-md strong{color:#e2e8f0;font-weight:600;} .feed-md a{color:#60a5fa;text-decoration:underline;}
     .feed-md blockquote{border-left:3px solid #475569;padding-left:.8em;color:#94a3b8;margin:.5em 0;}
     .scroll-body{max-height:340px;overflow:auto;} .scroll-body::-webkit-scrollbar{width:8px;} .scroll-body::-webkit-scrollbar-thumb{background:#334155;border-radius:8px;}
+    #live-cy{width:100%;height:280px;background:transparent;}
+    @media(min-width:768px){#live-cy{height:320px;}}
 
     /* ── Light, print-friendly layout used only for the PDF export ─────────── */
     .pdf-holder{position:absolute;left:-9999px;top:0;pointer-events:none;}
@@ -83,6 +87,7 @@
     <div class="flex items-center gap-3">
       <div id="timer" class="hidden text-sm font-mono text-slate-400 tabular-nums">0.0s</div>
       <div id="status-pill" class="text-xs px-3 py-1.5 rounded-full bg-slate-800/80 text-slate-400 border border-slate-700">idle</div>
+      <a href="/blueprint" data-blueprint-link target="_blank" rel="noopener" title="Agent graph blueprint (opens new tab)" class="text-xs px-3 py-1.5 rounded-lg border border-slate-700 hover:border-sky-400 text-slate-400 hover:text-sky-300 transition hidden sm:inline-flex items-center gap-1">🗺️ Blueprint</a>
       <button id="admin-btn" title="Admin settings" class="w-9 h-9 rounded-lg border border-slate-700 bg-slate-900/60 hover:border-slate-500 text-slate-400 hover:text-slate-200 transition flex items-center justify-center">⚙</button>
     </div>
   </header>
@@ -169,15 +174,52 @@
     </div>
   </section>
 
+  <!-- ░░ Run economics (tokens & estimated cost) ░░ -->
+  <section id="economics" class="hidden bg-slate-900/70 backdrop-blur border border-slate-800 rounded-2xl p-5 mb-6 shadow-xl shadow-black/20">
+    <div class="flex items-center justify-between gap-3 flex-wrap mb-4">
+      <div class="flex items-center gap-2">
+        <span class="text-sm font-semibold text-emerald-300">⚡ Run economics</span>
+        <span class="text-[11px] text-slate-500">live token &amp; cost meter — per agent</span>
+      </div>
+      <div id="econ-total-cost" class="text-right"></div>
+    </div>
+    <div id="econ-stats" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5"></div>
+    <div class="text-[11px] uppercase tracking-wide text-slate-500 mb-2">Cost by agent</div>
+    <div id="econ-bars" class="space-y-1.5"></div>
+    <div class="text-[11px] uppercase tracking-wide text-slate-500 mt-5 mb-2">By stage</div>
+    <div id="econ-stages" class="grid grid-cols-2 md:grid-cols-5 gap-2"></div>
+    <p class="mt-4 text-[10px] text-slate-600 leading-relaxed">
+      Token counts are exact (from each provider's usage reporting). Cost is <span class="text-slate-500">estimated</span> from the editable price table in <code class="text-amber-500/80">web/usage.py</code> — update it to match your live rates. Models that don't report usage, or aren't in the table, show tokens only.
+    </p>
+  </section>
+
   <!-- ░░ Stage stepper ░░ -->
   <section id="stepper" class="hidden grid grid-cols-2 md:grid-cols-5 gap-2 mb-6"></section>
 
   <!-- ░░ Identity ░░ -->
   <div id="identity" class="hidden bg-slate-900/50 border border-slate-800 rounded-xl px-4 py-2.5 mb-5 text-xs text-slate-400 whitespace-pre-wrap font-mono leading-relaxed"></div>
 
-  <!-- ░░ Pipeline strip ░░ -->
-  <section id="pipeline-wrap" class="hidden bg-slate-900/50 border border-slate-800 rounded-xl p-3 mb-6">
-    <div id="pipeline" class="flex flex-wrap items-center gap-1.5 text-xs"></div>
+  <!-- ░░ Live agent graph ░░ -->
+  <section id="graph-wrap" class="hidden bg-slate-900/50 border border-slate-800 rounded-xl mb-6 overflow-hidden">
+    <div class="flex items-center justify-between px-4 py-2 border-b border-slate-800/80">
+      <div class="flex items-center gap-2">
+        <span class="text-sm font-semibold text-sky-300">Live agent graph</span>
+        <span class="text-[10px] text-slate-500">agents + purple memory flow during the run</span>
+      </div>
+      <div class="flex items-center gap-2">
+        <button id="graph-fit" type="button" class="text-[10px] px-2 py-1 rounded border border-slate-700 text-slate-400 hover:text-slate-200">Fit</button>
+        <a href="/blueprint" data-blueprint-link target="_blank" rel="noopener" class="text-[10px] px-2 py-1 rounded border border-slate-700 text-slate-400 hover:text-sky-300">Full blueprint ↗</a>
+      </div>
+    </div>
+    <div id="memory-status" class="hidden px-4 py-1.5 text-[10px] text-purple-300/90 border-b border-purple-500/20 bg-purple-950/20 flex items-center gap-2">
+      <span class="w-1.5 h-1.5 rounded-full bg-purple-400 pulse-dot"></span>
+      <span id="memory-status-text">Memory</span>
+    </div>
+    <div class="relative">
+      <div id="live-cy"></div>
+      <div id="pipeline" class="hidden"></div>
+    </div>
+    <div id="graph-detail" class="hidden px-4 py-2 pb-3 text-xs text-slate-400 border-t border-slate-800/60"></div>
   </section>
 
   <!-- ░░ Stage feed ░░ -->
@@ -264,6 +306,97 @@ if(window.marked && marked.use){
 let plannedNodes = [], nodeEls = {}, cardEls = {}, sectionEls = {};
 let activeES = null, t0 = 0, timerInt = null, currentParams = null;
 let marketChartEl = null;  // chart container kept for PDF export
+let usageByNode = {}, usageTotals = null;  // run economics (tokens + est. cost)
+let liveCy = null, graphBlueprint = null;
+let activeRunId = null;  // current run id, mirrored into blueprint links for live watch
+const SESSION_KEY = "stockagents_active_run";
+
+function getFormState(){
+  return {
+    ticker: $("ticker").value.trim().toUpperCase(),
+    trade_date: $("trade_date").value,
+    asset_type: $("asset_type").value,
+    analysts: [...document.querySelectorAll("#analysts input:checked")].map((c)=>c.value),
+    max_debate_rounds: $("max_debate_rounds").value,
+    max_risk_rounds: $("max_risk_rounds").value,
+  };
+}
+function applyFormState(state){
+  if(!state) return;
+  if(state.ticker) $("ticker").value=state.ticker;
+  if(state.trade_date) $("trade_date").value=state.trade_date;
+  if(state.asset_type) $("asset_type").value=state.asset_type;
+  if(state.analysts && state.analysts.length){
+    document.querySelectorAll("#analysts input").forEach((cb)=>{ cb.checked=state.analysts.includes(cb.value); });
+  }
+  if(state.max_debate_rounds) $("max_debate_rounds").value=state.max_debate_rounds;
+  if(state.max_risk_rounds) $("max_risk_rounds").value=state.max_risk_rounds;
+}
+function updateBlueprintLinks(){
+  const f=getFormState();
+  const q=new URLSearchParams({
+    analysts: (f.analysts||[]).join(",") || "market,social,news,fundamentals",
+    max_debate_rounds: f.max_debate_rounds||"1",
+    max_risk_rounds: f.max_risk_rounds||"1",
+  });
+  if(activeRunId) q.set("run_id", activeRunId);  // lets /blueprint watch this run live
+  const url=`/blueprint?${q}`;
+  document.querySelectorAll("[data-blueprint-link]").forEach((a)=>{ a.href=url; });
+}
+function saveActiveRun(payload){ sessionStorage.setItem(SESSION_KEY, JSON.stringify(payload)); }
+function clearActiveRun(){ sessionStorage.removeItem(SESSION_KEY); }
+
+function connectEventSource(runId){
+  if(activeES) activeES.close();
+  activeES=new EventSource(`/api/runs/${runId}/events`);
+  activeES.onmessage=(m)=>{ if(m.data) handleEvent(JSON.parse(m.data)); };
+  activeES.onerror=()=>{
+    if($("run-btn").disabled && !$("run-btn").dataset.finished){
+      statusPill("connection lost","#f43f5e");
+      stopTimer();
+      $("run-btn").disabled=false;
+      $("new-run").disabled=false;
+    }
+    if(activeES) activeES.close();
+  };
+}
+
+async function tryRestoreActiveRun(){
+  const raw=sessionStorage.getItem(SESSION_KEY);
+  if(!raw) return;
+  let state;
+  try{ state=JSON.parse(raw); }catch{ clearActiveRun(); return; }
+  if(!state.run_id) return;
+
+  let statusRes;
+  try{ statusRes=await fetch(`/api/runs/${state.run_id}`); }catch{ return; }
+  if(!statusRes.ok){ clearActiveRun(); return; }
+  const status=await statusRes.json();
+
+  resetUI();
+  applyFormState(state);
+  activeRunId=state.run_id;
+  updateBlueprintLinks();
+  currentParams={ticker:state.ticker, trade_date:state.trade_date, asset_type:state.asset_type||"stock"};
+  $("run-form").classList.add("hidden");
+  $("run-summary").classList.remove("hidden");
+  $("run-summary-text").textContent=runSummaryLabel(state.ticker, state.trade_date, (state.analysts||[]).length, (state.analysts||[]).length+FIXED_AGENTS);
+  $("verdict").classList.remove("hidden");
+  $("empty").classList.add("hidden");
+
+  if(status.active){
+    $("run-btn").disabled=true;
+    $("new-run").disabled=true;
+    statusPill("reconnected — catching up…","#38bdf8");
+    startTimer();
+  } else {
+    statusPill("restored completed run","#38bdf8");
+    $("run-btn").dataset.finished="1";
+  }
+
+  await loadLiveGraph(state.analysts||["market","social","news","fundamentals"]);
+  connectEventSource(state.run_id);
+}
 
 function tint(hex, a){ return hex + Math.round(a*255).toString(16).padStart(2,"0"); }
 function avatarTile(icon, color, size){
@@ -279,7 +412,7 @@ function statusPill(text, color="#94a3b8"){ const e=$("status-pill"); e.textCont
 function startTimer(){ t0=Date.now(); $("timer").classList.remove("hidden"); timerInt=setInterval(()=>{ $("timer").textContent=((Date.now()-t0)/1000).toFixed(1)+"s"; },100); }
 function stopTimer(){ clearInterval(timerInt); }
 
-async function loadConfig(){
+async function loadConfig() {
   const cfg = await (await fetch("/api/config")).json();
   $("provider").value=cfg.provider||""; $("deep_model").value=cfg.deep_model||"";
   $("quick_model").value=cfg.quick_model||""; $("max_debate_rounds").value=cfg.max_debate_rounds??1; $("max_risk_rounds").value=cfg.max_risk_rounds??1;
@@ -292,6 +425,11 @@ async function loadConfig(){
     wrap.appendChild(l);
   });
   $("trade_date").value=new Date().toISOString().slice(0,10);
+  updateBlueprintLinks();
+  document.querySelectorAll("#analysts input, #max_debate_rounds, #max_risk_rounds").forEach((el)=>{
+    el.addEventListener("change", updateBlueprintLinks);
+  });
+  await tryRestoreActiveRun();
 }
 
 // ── stepper ───────────────────────────────────────────────────────────────
@@ -322,32 +460,50 @@ function refreshStepper(){
   });
 }
 
-// ── pipeline strip ──────────────────────────────────────────────────────────
+// ── live agent graph (Cytoscape) ───────────────────────────────────────────
+async function loadLiveGraph(analysts){
+  const debate=parseInt($("max_debate_rounds").value)||1;
+  const risk=parseInt($("max_risk_rounds").value)||1;
+  const q=new URLSearchParams({analysts:analysts.join(","),max_debate_rounds:debate,max_risk_rounds:risk,include_internal:"0"});
+  try{
+    const res=await fetch(`/api/graph/blueprint?${q}`);
+    if(!res.ok) return;
+    graphBlueprint=await res.json();
+    $("graph-wrap").classList.remove("hidden");
+    const container=$("live-cy");
+    if(liveCy) liveCy.destroy();
+    liveCy=TAGraph.createGraph(container, graphBlueprint, {
+      showInternal:false,
+      liveMode:true,
+      onNodeSelect(data){
+        const panel=$("graph-detail");
+        panel.classList.remove("hidden");
+        TAGraph.renderDetailPanel(panel, data);
+      },
+    });
+  }catch(e){ console.warn("graph load failed", e); }
+}
 function buildPipeline(nodes){
-  plannedNodes=nodes; nodeEls={}; const wrap=$("pipeline"); wrap.innerHTML="";
-  $("pipeline-wrap").classList.remove("hidden");
-  nodes.forEach((n,i)=>{
-    const m=NODE[n]||{icon:"•",color:"#94a3b8"};
-    const pill=document.createElement("div");
-    pill.dataset.state="pending"; pill.dataset.node=n;
-    pill.className="px-2 py-1 rounded-lg border text-slate-400 transition flex items-center gap-1";
-    pill.style.borderColor="#334155"; pill.style.background="#0f172a80";
-    pill.innerHTML=`<span data-dot>○</span><span>${m.icon}</span><span class="hidden sm:inline">${n}</span>`;
-    nodeEls[n]=pill; wrap.appendChild(pill);
-    if(i<nodes.length-1){ const a=document.createElement("span"); a.className="text-slate-700"; a.textContent="›"; wrap.appendChild(a); }
-  });
+  plannedNodes=nodes; nodeEls={};
+  nodes.forEach(n=>{ nodeEls[n]={ dataset:{ state:"pending", node:n } }; });
 }
 function setNodeState(n,state){
-  const el=nodeEls[n]; if(!el) return; const m=NODE[n]||{color:"#94a3b8"};
-  el.dataset.state=state; const dot=el.querySelector("[data-dot]");
-  if(state==="running"){ el.style.borderColor=m.color; el.style.background=tint(m.color,.12); el.style.color=m.color; dot.textContent="◍"; dot.className="pulse-dot"; }
-  else if(state==="done"){ el.style.borderColor=m.color; el.style.background=tint(m.color,.16); el.style.color=m.color; dot.textContent="✓"; dot.className=""; }
+  if(nodeEls[n]) nodeEls[n].dataset.state=state;
+  if(liveCy) TAGraph.setNodeState(liveCy, n, state);
   refreshStepper();
 }
-function markRunningNext(doneNode){
-  const i=plannedNodes.indexOf(doneNode);
-  for(let j=i+1;j<plannedNodes.length;j++){ if(nodeEls[plannedNodes[j]]){ setNodeState(plannedNodes[j],"running"); break; } }
+
+/** Keep the live graph in sync even when a prior agent never emitted "done". */
+function applyGraphProgress(ev){
+  if(!plannedNodes.length || !ev) return;
+  const completed=ev.completed || [];
+  completed.forEach((n)=>{ if(plannedNodes.includes(n)) setNodeState(n,"done"); });
+  if(ev.active && plannedNodes.includes(ev.active)){
+    setNodeState(ev.active, completed.includes(ev.active) ? "done" : "running");
+  }
 }
+
+$("graph-fit").onclick=()=> liveCy && liveCy.fit(undefined, 40);
 
 // ── stage feed ────────────────────────────────────────────────────────────
 function section(stageKey){
@@ -463,6 +619,71 @@ function renderChart(container, d){
   container.__charts=charts; marketChartEl=container;  // expose for PDF export
 }
 
+// ── run economics (tokens & estimated cost) ─────────────────────────────────
+function fmtInt(n){ return (n||0).toLocaleString(); }
+function fmtTok(n){ n=n||0; if(n<1000) return ""+n; const k=n/1000; return (k>=100?Math.round(k):k.toFixed(1))+"k"; }
+function fmtCost(c){ if(c==null) return "—"; if(c===0) return "$0"; return c<1 ? "$"+c.toFixed(4) : "$"+c.toFixed(2); }
+
+function renderEconomics(){
+  const nodes=Object.values(usageByNode);
+  if(!nodes.length) return;
+  $("economics").classList.remove("hidden");
+
+  // Totals: prefer the authoritative summary when it has arrived.
+  let tin=0,tout=0,tcost=0,costKnown=false;
+  nodes.forEach(n=>{ tin+=n.input_tokens||0; tout+=n.output_tokens||0; if(n.cost!=null){tcost+=n.cost;costKnown=true;} });
+  if(usageTotals){ tin=usageTotals.input_tokens||0; tout=usageTotals.output_tokens||0; if(usageTotals.cost!=null){tcost=usageTotals.cost;costKnown=true;} }
+  const ttot=tin+tout;
+
+  // Hero cost (top-right of the panel header).
+  $("econ-total-cost").innerHTML = costKnown
+    ? `<div class="text-2xl font-black text-amber-300 tabular-nums leading-none">${fmtCost(tcost)}</div><div class="text-[10px] text-slate-500 mt-0.5">estimated run cost</div>`
+    : `<div class="text-sm text-slate-500">cost n/a — price this model in web/usage.py</div>`;
+
+  // Stat tiles.
+  const tiles=[
+    {label:"Total tokens", value:fmtInt(ttot), accent:"#34d399"},
+    {label:"Input tokens", value:fmtInt(tin), accent:"#38bdf8"},
+    {label:"Output tokens", value:fmtInt(tout), accent:"#a78bfa"},
+    {label:"Est. cost", value:costKnown?fmtCost(tcost):"n/a", accent:"#fbbf24"},
+  ];
+  $("econ-stats").innerHTML = tiles.map(t=>`
+    <div class="rounded-xl border border-slate-800 bg-slate-950/40 px-3 py-2.5">
+      <div class="text-[10px] uppercase tracking-wide text-slate-500">${t.label}</div>
+      <div class="text-lg font-bold tabular-nums" style="color:${t.accent}">${t.value}</div>
+    </div>`).join("");
+
+  // Per-agent bars — rank by cost when priced, else by total tokens.
+  const useCost=costKnown;
+  const metric=n=> useCost ? (n.cost||0) : (n.total_tokens||0);
+  const sorted=nodes.slice().sort((a,b)=>metric(b)-metric(a));
+  const max=Math.max(...sorted.map(metric), 1e-9);
+  $("econ-bars").innerHTML = sorted.map(n=>{
+    const m=NODE[n.node]||{color:"#94a3b8",icon:"•"};
+    const pct=Math.max(3, metric(n)/max*100);
+    const right=useCost ? fmtCost(n.cost) : fmtTok(n.total_tokens);
+    return `<div class="flex items-center gap-2" title="${n.node}: ${fmtInt(n.input_tokens)} in / ${fmtInt(n.output_tokens)} out${n.cost!=null?' · '+fmtCost(n.cost):''}${n.calls?' · '+n.calls+' call'+(n.calls>1?'s':''):''}${n.model?' · '+n.model:''}">
+      <div class="w-36 sm:w-44 shrink-0 text-xs text-slate-300 truncate"><span style="color:${m.color}">${m.icon}</span> ${n.node}</div>
+      <div class="flex-1 h-5 rounded-md bg-slate-800/40 overflow-hidden relative">
+        <div class="h-full rounded-md transition-all duration-500" style="width:${pct}%;background:${tint(m.color,.6)}"></div>
+        <div class="absolute inset-0 flex items-center justify-end pr-2 text-[10px] text-slate-200 tabular-nums">${right}</div>
+      </div>
+    </div>`;
+  }).join("");
+
+  // Stage rollup.
+  const agg={};
+  nodes.forEach(n=>{ const st=(NODE[n.node]||{}).stage||"Other"; const a=agg[st]||(agg[st]={tok:0,cost:0,known:false}); a.tok+=n.total_tokens||0; if(n.cost!=null){a.cost+=n.cost;a.known=true;} });
+  $("econ-stages").innerHTML = STAGES.filter(s=>agg[s.key]).map(s=>{
+    const a=agg[s.key];
+    return `<div class="rounded-lg border border-slate-800 bg-slate-950/30 px-3 py-2">
+      <div class="text-[10px]" style="color:${s.color}">${s.icon} ${s.label}</div>
+      <div class="text-sm font-semibold text-slate-200 tabular-nums">${a.known?fmtCost(a.cost):fmtTok(a.tok)+" tok"}</div>
+      ${a.known?`<div class="text-[10px] text-slate-500 tabular-nums">${fmtTok(a.tok)} tok</div>`:""}
+    </div>`;
+  }).join("");
+}
+
 // ── verdict ───────────────────────────────────────────────────────────────
 function showVerdict(decision,content){
   $("verdict-sub").textContent="Synthesis of the full debate";
@@ -483,19 +704,71 @@ function showVerdict(decision,content){
   }
 }
 
+const MEMORY_STATUS = {
+  resolve: { start: "Resolving pending outcomes from prior runs…", done: (ev) => ev.resolved ? `Resolved ${ev.resolved} prior decision(s) with market returns` : "No pending outcomes to resolve yet" },
+  identity: { done: "Instrument identity grounded for all agents" },
+  inject: { _: (ev) => ev.has_context ? "Past lessons injected → Portfolio Manager (past_context)" : "No prior lessons for this ticker — fresh analysis" },
+  consume: { _: "Portfolio Manager reading past_context from memory log" },
+  store: { done: "Decision stored to memory log (pending until next run)" },
+};
+
+function showMemoryStatus(text){
+  const bar=$("memory-status"), txt=$("memory-status-text");
+  if(!text){ bar.classList.add("hidden"); return; }
+  bar.classList.remove("hidden"); txt.textContent=text;
+}
+
+function handleMemoryEvent(ev){
+  if(!liveCy) return;
+  const phase=ev.phase;
+  if(phase==="resolve" && ev.status==="start"){ TAGraph.setMemoryPhase(liveCy,"resolve"); showMemoryStatus(MEMORY_STATUS.resolve.start); return; }
+  if(phase==="resolve" && ev.status==="done"){
+    TAGraph.clearMemoryFlow(liveCy);
+    const msg=typeof MEMORY_STATUS.resolve.done==="function"?MEMORY_STATUS.resolve.done(ev):MEMORY_STATUS.resolve.done;
+    showMemoryStatus(msg);
+    return;
+  }
+  if(phase==="identity"){ TAGraph.setMemoryPhase(liveCy,"identity"); showMemoryStatus(MEMORY_STATUS.identity.done); return; }
+  if(phase==="inject"){
+    TAGraph.setMemoryPhase(liveCy,"inject");
+    showMemoryStatus(MEMORY_STATUS.inject._(ev));
+    return;
+  }
+  if(phase==="store" && ev.status==="done"){
+    TAGraph.setMemoryPhase(liveCy,"store");
+    showMemoryStatus(MEMORY_STATUS.store.done);
+    setTimeout(()=>{ TAGraph.clearMemoryFlow(liveCy); showMemoryStatus(""); }, 4000);
+  }
+}
+
 // ── event handling ──────────────────────────────────────────────────────────
 function handleEvent(ev){
   switch(ev.type){
     case "nodes": buildPipeline(ev.nodes); buildStepper(); if(ev.nodes.length) setNodeState(ev.nodes[0],"running"); break;
+    case "graph":
+      if(liveCy && ev.node) TAGraph.pulseToolActivity(liveCy, ev.node);
+      break;
+    case "memory": handleMemoryEvent(ev); break;
+    case "progress": applyGraphProgress(ev); break;
     case "status": statusPill(ev.message,"#fbbf24"); $("verdict-sub").textContent=ev.message; break;
     case "identity": $("identity").classList.remove("hidden"); $("identity").textContent=ev.content; break;
     case "agent":
-      if(ev.status==="running"){ setNodeState(ev.node,"running"); feedCard(ev.node); }
-      else { setNodeState(ev.node,"done"); updateCard(ev.node,{status:"done",content:ev.content}); markRunningNext(ev.node); }
+      if(ev.node==="Portfolio Manager" && ev.status==="running"){
+        TAGraph.setMemoryPhase(liveCy,"consume");
+        showMemoryStatus(MEMORY_STATUS.consume._);
+      }
+      if(ev.status==="running"){ feedCard(ev.node); }
+      else { updateCard(ev.node,{status:"done",content:ev.content}); }
       break;
+    case "usage": usageByNode[ev.node]=ev; renderEconomics(); break;
+    case "usage_summary": if(ev.nodes) usageByNode=ev.nodes; usageTotals=ev.totals||null; renderEconomics(); break;
     case "final": showVerdict(ev.decision,ev.content); break;
     case "error": statusPill("error","#f43f5e"); showError(ev.message); break;
-    case "done": statusPill("complete","#34d399"); stopTimer(); $("run-btn").disabled=false; $("new-run").disabled=false; $("download-pdf").classList.remove("hidden"); if(activeES) activeES.close(); break;
+    case "done":
+      plannedNodes.forEach((n)=>setNodeState(n,"done"));
+      clearActiveRun();
+      $("run-btn").dataset.finished="1";
+      statusPill("complete","#34d399"); stopTimer(); $("run-btn").disabled=false; $("new-run").disabled=false; $("download-pdf").classList.remove("hidden"); if(activeES) activeES.close(); break;
   }
 }
 function showError(msg){
@@ -510,6 +783,10 @@ function resetUI(){
   $("cache-banner").classList.add("hidden"); $("cache-banner").style.display="none";
   cardEls={}; sectionEls={}; marketChartEl=null; $("empty").classList.add("hidden");
   $("download-pdf").classList.add("hidden");
+  usageByNode={}; usageTotals=null; $("economics").classList.add("hidden");
+  if(liveCy){ TAGraph.clearNodeStates(liveCy); }
+  $("graph-detail").classList.add("hidden"); $("graph-detail").innerHTML="";
+  showMemoryStatus("");
 }
 
 // ── cached render (60-minute cache hit) ─────────────────────────────────────
@@ -525,8 +802,14 @@ function renderCached(run){
   const nodes=[]; agents.forEach(a=>{ if(!nodes.includes(a.agent)) nodes.push(a.agent); });
   const selAnalysts=nodes.filter(n=>NODE[n]?.stage==="Analysis").length;
   $("run-summary-text").textContent=runSummaryLabel(run.ticker, run.trade_date, selAnalysts, nodes.length);
-  buildPipeline(nodes); buildStepper();
-  nodes.forEach(n=>setNodeState(n,"done"));
+  const cachedAnalysts=nodes.filter(n=>NODE[n]?.stage==="Analysis").map(n=>{
+    const m={"Market Analyst":"market","Sentiment Analyst":"social","News Analyst":"news","Fundamentals Analyst":"fundamentals"};
+    return m[n];
+  }).filter(Boolean);
+  loadLiveGraph(cachedAnalysts.length?cachedAnalysts:["market","social","news","fundamentals"]).then(()=>{
+    buildPipeline(nodes); buildStepper();
+    nodes.forEach(n=>setNodeState(n,"done"));
+  });
   if(run.identity){ $("identity").classList.remove("hidden"); $("identity").textContent=run.identity; }
   agents.forEach(a=>updateCard(a.agent,{status:"done",content:a.content}));
   $("verdict").classList.remove("hidden");
@@ -536,13 +819,22 @@ function renderCached(run){
   $("run-btn").disabled=false; $("new-run").disabled=false; $("download-pdf").classList.remove("hidden");
 }
 
-$("new-run").onclick=()=>{ $("run-form").classList.remove("hidden"); $("run-summary").classList.add("hidden"); };
+$("new-run").onclick=()=>{
+  clearActiveRun();
+  activeRunId=null;
+  updateBlueprintLinks();
+  delete $("run-btn").dataset.finished;
+  if(activeES) activeES.close();
+  $("run-form").classList.remove("hidden");
+  $("run-summary").classList.add("hidden");
+};
 $("run-fresh").onclick=()=>startRun(true);
 
 async function startRun(force){
   resetUI();
   const analysts=[...document.querySelectorAll("#analysts input:checked")].map(c=>c.value);
   if(!analysts.length){ statusPill("pick an analyst","#f43f5e"); return; }
+  delete $("run-btn").dataset.finished;
   $("run-btn").disabled=true; $("new-run").disabled=true; statusPill(force?"running fresh…":"starting…","#fbbf24");
   $("verdict").classList.remove("hidden"); $("verdict-word").textContent="…"; $("verdict-word").style.color="#94a3b8"; $("verdict-marker").classList.add("hidden"); $("verdict-sub").textContent="Agents are deliberating…";
 
@@ -562,10 +854,12 @@ async function startRun(force){
 
   if(data.cached && data.run){ renderCached(data.run); return; }
 
+  activeRunId=data.run_id;
+  saveActiveRun({...body, run_id:data.run_id});
+  updateBlueprintLinks();
+  await loadLiveGraph(analysts);
   startTimer();
-  activeES=new EventSource(`/api/runs/${data.run_id}/events`);
-  activeES.onmessage=(m)=>handleEvent(JSON.parse(m.data));
-  activeES.onerror=()=>{ if($("run-btn").disabled){ statusPill("connection lost","#f43f5e"); stopTimer(); $("run-btn").disabled=false; $("new-run").disabled=false; } activeES.close(); };
+  connectEventSource(data.run_id);
 }
 
 $("run-form").addEventListener("submit",(e)=>{ e.preventDefault(); startRun(false); });

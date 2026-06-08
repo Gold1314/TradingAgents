@@ -162,5 +162,29 @@ def get_recent_run(
         return None
 
 
+# ── blueprint email capture ───────────────────────────────────────────────────
+def store_blueprint_email(email: str, meta: Optional[Dict[str, Any]] = None) -> bool:
+    """Record an email that unlocked the blueprint. Fail-open like the rest of db.
+
+    Returns True only when the row was actually written to Supabase; callers
+    should treat False as "not persisted" (e.g. Supabase not configured), not as
+    a hard error — access is still granted regardless.
+    """
+    client = _get_client()
+    if client is None:
+        return False
+    try:
+        row = {
+            "email": email,
+            "analysts": (meta or {}).get("analysts"),
+            "user_agent": (meta or {}).get("user_agent"),
+        }
+        client.table("blueprint_leads").insert(row).execute()
+        return True
+    except Exception as exc:  # noqa: BLE001 — capture must never block access
+        logger.warning("store_blueprint_email failed: %s", exc)
+        return False
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
