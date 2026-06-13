@@ -515,7 +515,7 @@ async function onRobinhoodBadge(){
 }
 async function loadAccount(open){
   const panel=$("account-panel");
-  if(open) panel.classList.remove("hidden");
+  if(open){ panel.classList.remove("hidden"); panel.scrollIntoView({behavior:"smooth",block:"center"}); }
   $("account-mode").textContent = rhConfig ? rhBadgeLabel(rhConfig).replace("Robinhood · ","") : "manual";
   $("account-summary").textContent="";
   $("account-body").innerHTML=`<span class="text-slate-500">Loading account…</span>`;
