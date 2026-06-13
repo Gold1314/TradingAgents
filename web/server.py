@@ -1311,6 +1311,11 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # ── Mobile (iOS) API — additive, default OFF (see web/mobile/) ────────────────
 # Registers the versioned /api/v2/* router only when MOBILE_API_ENABLED is set.
 # A no-op (and imports nothing further) otherwise, so the web app is unchanged.
-from web.mobile import include_mobile_api  # noqa: E402
+# Guarded: the web/mobile package is optional/in-progress, so a missing module
+# must degrade gracefully (skip the mobile API) rather than crash the server.
+try:
+    from web.mobile import include_mobile_api  # noqa: E402
 
-include_mobile_api(app)
+    include_mobile_api(app)
+except ImportError as exc:  # noqa: BLE001 — mobile API is optional
+    logger.warning("Mobile API unavailable, skipping (/api/v2 disabled): %s", exc)
