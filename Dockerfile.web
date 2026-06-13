@@ -23,16 +23,23 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
+# gosu lets the entrypoint start as root (to take ownership of a root-owned
+# mounted volume) and then drop to the unprivileged app user for the server.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gosu \
+ && rm -rf /var/lib/apt/lists/*
+
 # Non-root user with a writable home for the data/results cache dirs.
 RUN useradd --create-home appuser \
  && install -d -m 0755 -o appuser -g appuser /home/appuser/.tradingagents
-USER appuser
 WORKDIR /home/appuser/app
 
 COPY --from=builder --chown=appuser:appuser /build .
 
-# Entrypoint seeds the Robinhood OAuth token from $ROBINHOOD_TOKEN_JSON (if set,
-# for headless PaaS where the browser OAuth flow can't run) and then binds
-# Railway's injected $PORT (falls back to 8000 locally). Single worker: the SSE
-# run registry lives in process memory.
+# Entrypoint starts as root: it takes ownership of the (root-owned) token
+# directory — e.g. a Railway volume mounted at /data — seeds the Robinhood OAuth
+# token from $ROBINHOOD_TOKEN_JSON when present (headless PaaS can't run the
+# browser OAuth flow), then drops to `appuser` (via gosu) to run uvicorn bound
+# to Railway's injected $PORT (8000 locally). Single worker: the SSE run
+# registry lives in process memory.
 ENTRYPOINT ["sh", "web/entrypoint.sh"]

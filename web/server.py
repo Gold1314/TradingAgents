@@ -22,6 +22,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ import re
 import threading
 import time
 import traceback
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -967,6 +969,90 @@ def _geo_from_request(request: Request) -> Dict[str, Optional[str]]:
     }
 
 
+# ── server-side GeoIP fallback ────────────────────────────────────────────────
+# When no edge/CDN geo headers are present (e.g. on bare Railway), resolve
+# country/region/city from the *real* client IP via a free GeoIP API. The lookup
+# is best-effort and must never slow down or block a request:
+#   • cached in-memory per IP with a long TTL (most visitors repeat),
+#   • performed in a daemon thread on a miss — the current request returns empty
+#     geo and the cache is warmed for subsequent events from that IP,
+#   • fully fail-open: any error/timeout yields empty geo.
+# The lookup uses the un-anonymized IP for accuracy, but only the anonymized IP
+# is ever stored (see ``_client_meta``).
+_EMPTY_GEO: Dict[str, Optional[str]] = {"country": None, "region": None, "city": None}
+_GEO_ENABLED = os.environ.get("ANALYTICS_GEOIP", "true").strip().lower() != "false"
+_GEO_TTL = float(os.environ.get("ANALYTICS_GEOIP_TTL", "86400"))  # 24h
+_GEO_PROVIDER_URL = os.environ.get("ANALYTICS_GEOIP_URL", "https://ipapi.co/{ip}/json/")
+_GEO_MAX_CACHE = 10000
+_geo_cache: Dict[str, tuple[float, Dict[str, Optional[str]]]] = {}
+_geo_inflight: set[str] = set()
+_geo_lock = threading.Lock()
+
+
+def _is_public_ip(ip: str) -> bool:
+    """True only for routable, non-private addresses worth geolocating."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    )
+
+
+def _geo_fetch(ip: str) -> Dict[str, Optional[str]]:
+    """Blocking GeoIP request. Only ever called from a background thread."""
+    try:
+        req = urllib.request.Request(
+            _GEO_PROVIDER_URL.format(ip=ip),
+            headers={"User-Agent": "TradingAgents/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(data, dict) or data.get("error"):
+            return dict(_EMPTY_GEO)
+        return {
+            "country": data.get("country_code") or data.get("country") or None,
+            "region": data.get("region") or data.get("region_code") or None,
+            "city": data.get("city") or None,
+        }
+    except Exception:  # noqa: BLE001 — geo enrichment must never raise
+        return dict(_EMPTY_GEO)
+
+
+def _geo_worker(ip: str) -> None:
+    result = _geo_fetch(ip)
+    with _geo_lock:
+        if len(_geo_cache) >= _GEO_MAX_CACHE:
+            _geo_cache.clear()
+        _geo_cache[ip] = (time.time(), result)
+        _geo_inflight.discard(ip)
+
+
+def _geo_from_ip(ip: Optional[str]) -> Dict[str, Optional[str]]:
+    """Cached, non-blocking GeoIP lookup.
+
+    Returns cached geo when warm; on a miss returns empty geo immediately and
+    kicks off a one-shot background lookup to warm the cache for next time.
+    """
+    if not _GEO_ENABLED or not ip or not _is_public_ip(ip):
+        return dict(_EMPTY_GEO)
+    now = time.time()
+    with _geo_lock:
+        hit = _geo_cache.get(ip)
+        if hit and (now - hit[0]) < _GEO_TTL:
+            return dict(hit[1])
+        if ip not in _geo_inflight:
+            _geo_inflight.add(ip)
+            threading.Thread(target=_geo_worker, args=(ip,), daemon=True).start()
+    return dict(_EMPTY_GEO)
+
+
 def _client_meta(request: Request) -> Dict[str, Any]:
     """Unified, privacy-aware requester context for analytics rows."""
     raw_ip, fwd = _client_ip(request)
@@ -982,7 +1068,12 @@ def _client_meta(request: Request) -> Dict[str, Any]:
         "session_id": (request.headers.get("x-session-id") or "")[:64] or None,
     }
     meta.update(_parse_user_agent(ua))
-    meta.update(_geo_from_request(request))
+    geo = _geo_from_request(request)
+    # Fall back to a server-side GeoIP lookup (real IP) when the edge gave us
+    # nothing. Cached + background-warmed, so this never blocks the event loop.
+    if not any(geo.values()):
+        geo = _geo_from_ip(raw_ip)
+    meta.update(geo)
     return meta
 
 
