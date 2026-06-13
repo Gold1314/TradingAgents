@@ -858,6 +858,39 @@ async def robinhood_connect() -> dict:
     return await loop.run_in_executor(None, lambda: get_broker().connect())
 
 
+def _account_payload() -> dict:
+    """Read-only account snapshot, connecting headlessly from saved creds if needed."""
+    broker = get_broker()
+    if not broker.is_connected and broker.has_saved_credentials():
+        try:
+            broker.connect()
+        except Exception:  # noqa: BLE001 — report as "not connected", never raise
+            pass
+    if not broker.is_connected:
+        return {
+            "connected": False,
+            "message": "Robinhood not connected. Use Connect to authorize.",
+        }
+    return {"connected": True, **broker.get_account_snapshot().to_dict()}
+
+
+@app.get("/api/robinhood/account")
+async def robinhood_account() -> dict:
+    """Live account snapshot — buying power, portfolio value, positions.
+
+    Read-only (never places an order). Returns ``{connected: false, ...}``
+    instead of raising when the broker isn't authorized yet. Blocking broker
+    work runs in the thread pool."""
+    cfg = load_robinhood_config(DEFAULT_CONFIG)
+    if not cfg.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="Robinhood integration is disabled. Set TRADINGAGENTS_ROBINHOOD_ENABLED=true.",
+        )
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _account_payload)
+
+
 @app.post("/api/robinhood/orders/{run_id}")
 async def place_order(run_id: str, body: PlaceOrderRequest) -> dict:
     """Place the order proposed by a finished run (manual mode, button click).

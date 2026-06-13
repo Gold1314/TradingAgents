@@ -183,6 +183,22 @@
     <div id="trade-body" class="text-sm text-slate-300"></div>
   </section>
 
+  <!-- ░░ Robinhood account (toggled by the header badge) ░░ -->
+  <section id="account-panel" class="hidden bg-slate-900/70 backdrop-blur border border-emerald-500/30 rounded-2xl p-5 mb-6 shadow-xl shadow-black/20">
+    <div class="flex items-center justify-between gap-3 flex-wrap mb-3">
+      <div class="flex items-center gap-2">
+        <span class="text-sm font-semibold text-emerald-300">🪶 Robinhood account</span>
+        <span id="account-mode" class="text-[10px] uppercase tracking-wide px-2 py-0.5 rounded-full border border-emerald-500/40 text-emerald-300"></span>
+      </div>
+      <div class="flex items-center gap-2">
+        <button id="account-refresh" class="text-xs px-2 py-1 rounded-lg border border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-500 transition">Refresh</button>
+        <button id="account-close" class="text-xs px-2 py-1 rounded-lg border border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-500 transition">Close</button>
+      </div>
+    </div>
+    <div id="account-summary" class="text-[11px] text-slate-400 tabular-nums mb-3"></div>
+    <div id="account-body" class="text-sm text-slate-300"></div>
+  </section>
+
   <!-- ░░ Run economics (tokens & estimated cost) ░░ -->
   <section id="economics" class="hidden bg-slate-900/70 backdrop-blur border border-slate-800 rounded-2xl p-5 mb-6 shadow-xl shadow-black/20">
     <div class="flex items-center justify-between gap-3 flex-wrap mb-4">
@@ -483,7 +499,60 @@ function initRobinhood(rh){
   if(!rh || !rh.enabled){ btn.classList.add("hidden"); return; }
   btn.classList.remove("hidden"); btn.classList.add("inline-flex");
   refreshRobinhoodStatus();
-  btn.onclick=connectRobinhood;
+  btn.onclick=onRobinhoodBadge;
+  const rc=$("account-refresh"), cc=$("account-close");
+  if(rc) rc.onclick=()=>loadAccount(true);
+  if(cc) cc.onclick=()=>$("account-panel").classList.add("hidden");
+}
+// Badge click: if not connected yet, authorize; once connected, toggle a live
+// account panel (buying power + positions) so the click does something useful.
+async function onRobinhoodBadge(){
+  const connected = !!(rhConfig && rhConfig.connected);
+  if(!connected){ await connectRobinhood(); if(rhConfig && rhConfig.connected) loadAccount(true); return; }
+  const panel=$("account-panel");
+  if(panel.classList.contains("hidden")) loadAccount(true);
+  else panel.classList.add("hidden");
+}
+async function loadAccount(open){
+  const panel=$("account-panel");
+  if(open) panel.classList.remove("hidden");
+  $("account-mode").textContent = rhConfig ? rhBadgeLabel(rhConfig).replace("Robinhood · ","") : "manual";
+  $("account-summary").textContent="";
+  $("account-body").innerHTML=`<span class="text-slate-500">Loading account…</span>`;
+  try{
+    const res=await fetch("/api/robinhood/account");
+    const a=await res.json();
+    if(!res.ok || a.connected===false){
+      $("account-body").innerHTML=`<span class="text-amber-300">${(a&&(a.detail||a.message))||"Robinhood not connected."}</span>`;
+      return;
+    }
+    Analytics.track("robinhood_account_view",{positions:(a.positions||[]).length});
+    renderAccount(a);
+  }catch(e){ $("account-body").innerHTML=`<span class="text-rose-400">Couldn’t load account.</span>`; }
+}
+function posField(p, keys){ for(const k of keys){ if(p[k]!=null && p[k]!=="") return p[k]; } return null; }
+function renderAccount(a){
+  $("account-summary").textContent=`Buying power ${fmtUsd(a.buying_power)} · Portfolio ${fmtUsd(a.portfolio_value)}${a.account_number?` · #${a.account_number}`:""}`;
+  const positions=a.positions||[];
+  if(!positions.length){ $("account-body").innerHTML=`<span class="text-slate-500">No open positions.</span>`; return; }
+  const rows=positions.map((p)=>{
+    const sym=posField(p,["symbol","ticker","instrument_symbol","instrument"])||"—";
+    const qty=posField(p,["quantity","qty","shares"]);
+    const val=posField(p,["market_value","equity","value","total_value"]);
+    const avg=posField(p,["average_buy_price","average_price","avg_cost"]);
+    return `<tr class="border-t border-slate-800">
+      <td class="py-1.5 pr-3 font-semibold text-slate-200">${sym}</td>
+      <td class="py-1.5 pr-3 text-right tabular-nums">${qty!=null?Number(qty).toLocaleString():"—"}</td>
+      <td class="py-1.5 pr-3 text-right tabular-nums text-slate-400">${avg!=null?fmtUsd(avg):"—"}</td>
+      <td class="py-1.5 text-right tabular-nums">${val!=null?fmtUsd(val):"—"}</td></tr>`;
+  }).join("");
+  $("account-body").innerHTML=`<table class="w-full text-xs">
+    <thead><tr class="text-[10px] uppercase tracking-wide text-slate-500">
+      <th class="text-left font-medium pb-1">Symbol</th>
+      <th class="text-right font-medium pb-1">Qty</th>
+      <th class="text-right font-medium pb-1">Avg cost</th>
+      <th class="text-right font-medium pb-1">Market value</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
 }
 function rhBadgeLabel(st){
   if(st.can_place_real_orders) return "Robinhood · LIVE";
