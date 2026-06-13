@@ -184,6 +184,8 @@ class RobinhoodBroker:
             keywords = ("portfolio", "buying_power", "balance")
         elif category == "accounts":
             keywords = ("get_accounts", "accounts")
+        elif category == "quotes":
+            keywords = ("equity_quotes",)  # not index/option quotes
         elif category in ("account",):
             keywords = _ACCOUNT_KEYWORDS
         elif category == "review_order":
@@ -304,10 +306,12 @@ class RobinhoodBroker:
 
         Unlike :meth:`get_account_snapshot` (scoped to the agentic trading
         account), this reads positions from each account ``get_accounts`` returns
-        — including the main brokerage account that actually holds stock. Returns
-        normalized rows (symbol / quantity / average_buy_price / cost_basis plus a
-        masked ``account`` and ``agentic`` flag), sorted by cost basis. Read-only
-        and fail-open: any error yields an empty list.
+        — including the main brokerage account that actually holds stock. Each row
+        is normalized to symbol / quantity / average_buy_price / cost_basis plus a
+        masked ``account`` and ``agentic`` flag, and enriched with a live
+        ``last_price`` → ``market_value`` and ``gain`` / ``gain_pct`` when quotes
+        are available. Sorted by market value (cost basis fallback). Read-only and
+        fail-open: any error yields an empty list.
         """
         if not self._connected:
             return []
@@ -351,8 +355,58 @@ class RobinhoodBroker:
                         "agentic": agentic,
                     }
                 )
-        holdings.sort(key=lambda h: (h.get("cost_basis") or 0), reverse=True)
+        # Enrich with live prices → market value + gain/loss (best-effort).
+        prices = await self._async_quotes(
+            sorted({h["symbol"] for h in holdings if h.get("symbol")})
+        )
+        for h in holdings:
+            px = prices.get(h.get("symbol"))
+            if px is None or h.get("quantity") is None:
+                continue
+            h["last_price"] = px
+            h["market_value"] = h["quantity"] * px
+            cost = h.get("cost_basis")
+            if cost is not None:
+                h["gain"] = h["market_value"] - cost
+                h["gain_pct"] = (h["gain"] / cost * 100.0) if cost else None
+        holdings.sort(
+            key=lambda h: (h.get("market_value") or h.get("cost_basis") or 0), reverse=True
+        )
         return holdings
+
+    async def _async_quotes(self, symbols: List[str]) -> Dict[str, float]:
+        """Map ``symbol → last trade price`` via the equity-quotes tool.
+
+        Batches in chunks of 20 (the MCP omits closes above that) and is
+        fail-open: a failed chunk just leaves those symbols unpriced.
+        """
+        out: Dict[str, float] = {}
+        if not symbols:
+            return out
+        tool = self._resolve_tool("quotes")
+        if tool is None:
+            return out
+        for start in range(0, len(symbols), 20):
+            chunk = symbols[start : start + 20]
+            try:
+                data = _envelope(_coerce_result(await tool.ainvoke({"symbols": chunk})))
+            except Exception as exc:  # noqa: BLE001 — quotes are best-effort
+                logger.warning("Robinhood quotes fetch failed: %s", exc)
+                continue
+            results = data.get("results") if isinstance(data, dict) else data
+            for row in results or []:
+                quote = row.get("quote") if isinstance(row, dict) else None
+                if not isinstance(quote, dict):
+                    continue
+                sym = quote.get("symbol")
+                price = _to_float(
+                    quote.get("last_trade_price")
+                    or quote.get("last_non_reg_trade_price")
+                    or quote.get("previous_close")
+                )
+                if sym and price is not None:
+                    out[sym] = price
+        return out
 
     # ── order placement / review ─────────────────────────────────────────
     def place_order(self, intent: OrderIntent) -> Tuple[Optional[str], Any]:

@@ -530,24 +530,39 @@ async function loadAccount(open){
     renderAccount(a);
   }catch(e){ $("account-body").innerHTML=`<span class="text-rose-400">Couldn’t load account.</span>`; }
 }
+function gainColor(v){ return v==null?"#94a3b8":(v>=0?"#34d399":"#f43f5e"); }
+function fmtSigned(v){ if(v==null) return "—"; return (v>=0?"+":"-")+"$"+Math.abs(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function fmtPct(v){ if(v==null) return ""; return ` (${v>=0?"+":"-"}${Math.abs(v).toFixed(1)}%)`; }
 function renderAccount(a){
   const holdings=a.holdings||[];
-  const totalCost=holdings.reduce((s,h)=>s+(h.cost_basis||0),0);
   const multiAcct=new Set(holdings.map((h)=>h.account)).size>1;
-  $("account-summary").innerHTML=`Trading account ${a.account_number?`#${a.account_number}`:"—"} · Buying power ${fmtUsd(a.buying_power)}`
-    + (holdings.length?` &nbsp;•&nbsp; <span class="text-slate-300">${holdings.length} holding${holdings.length>1?"s":""}</span> · cost basis ${fmtUsd(totalCost)}`:"");
+  const totalCost=holdings.reduce((s,h)=>s+(h.cost_basis||0),0);
+  const priced=holdings.some((h)=>h.market_value!=null);
+  const totalValue=holdings.reduce((s,h)=>s+(h.market_value!=null?h.market_value:(h.cost_basis||0)),0);
+  const totalGain=priced?(totalValue-totalCost):null;
+  const totalGainPct=(priced&&totalCost)?(totalGain/totalCost*100):null;
+  let summary=`Trading account ${a.account_number?`#${a.account_number}`:"—"} · Buying power ${fmtUsd(a.buying_power)}`;
+  if(holdings.length){
+    summary+=` &nbsp;•&nbsp; <span class="text-slate-300">${holdings.length} holding${holdings.length>1?"s":""}</span> · ${priced?`value ${fmtUsd(totalValue)}`:`cost basis ${fmtUsd(totalCost)}`}`;
+    if(totalGain!=null) summary+=` · <span style="color:${gainColor(totalGain)}">${fmtSigned(totalGain)}${fmtPct(totalGainPct)}</span>`;
+  }
+  $("account-summary").innerHTML=summary;
   if(!holdings.length){ $("account-body").innerHTML=`<span class="text-slate-500">No open positions in any account.</span>`; return; }
   const rows=holdings.map((h)=>`<tr class="border-t border-slate-800">
       <td class="py-1.5 pr-3 font-semibold text-slate-200">${h.symbol||"—"}${multiAcct?` <span class="text-[9px] text-slate-500">${h.account}${h.agentic?" · agentic":""}</span>`:""}</td>
       <td class="py-1.5 pr-3 text-right tabular-nums">${h.quantity!=null?Number(h.quantity).toLocaleString(undefined,{maximumFractionDigits:6}):"—"}</td>
       <td class="py-1.5 pr-3 text-right tabular-nums text-slate-400">${h.average_buy_price!=null?fmtUsd(h.average_buy_price):"—"}</td>
-      <td class="py-1.5 text-right tabular-nums">${h.cost_basis!=null?fmtUsd(h.cost_basis):"—"}</td></tr>`).join("");
+      <td class="py-1.5 pr-3 text-right tabular-nums text-slate-400">${h.last_price!=null?fmtUsd(h.last_price):"—"}</td>
+      <td class="py-1.5 pr-3 text-right tabular-nums">${h.market_value!=null?fmtUsd(h.market_value):(h.cost_basis!=null?fmtUsd(h.cost_basis):"—")}</td>
+      <td class="py-1.5 text-right tabular-nums" style="color:${gainColor(h.gain)}">${h.gain!=null?fmtSigned(h.gain)+fmtPct(h.gain_pct):"—"}</td></tr>`).join("");
   $("account-body").innerHTML=`<div class="max-h-80 overflow-y-auto -mx-1 px-1"><table class="w-full text-xs">
     <thead class="sticky top-0 bg-slate-900/95 backdrop-blur"><tr class="text-[10px] uppercase tracking-wide text-slate-500">
       <th class="text-left font-medium pb-1">Symbol</th>
       <th class="text-right font-medium pb-1">Qty</th>
       <th class="text-right font-medium pb-1">Avg cost</th>
-      <th class="text-right font-medium pb-1">Cost basis</th></tr></thead>
+      <th class="text-right font-medium pb-1">Price</th>
+      <th class="text-right font-medium pb-1">Value</th>
+      <th class="text-right font-medium pb-1">Gain</th></tr></thead>
     <tbody>${rows}</tbody></table></div>`;
 }
 function rhBadgeLabel(st){
