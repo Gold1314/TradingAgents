@@ -871,7 +871,16 @@ def _account_payload() -> dict:
             "connected": False,
             "message": "Robinhood not connected. Use Connect to authorize.",
         }
-    return {"connected": True, **broker.get_account_snapshot().to_dict()}
+    snap = broker.get_account_snapshot()
+    holdings = broker.get_holdings()
+    return {
+        "connected": True,
+        **snap.to_dict(),
+        # Full portfolio across all accounts (main brokerage holds the stock; the
+        # agentic account is usually just cash for trading).
+        "holdings": holdings,
+        "holdings_count": len(holdings),
+    }
 
 
 @app.get("/api/robinhood/account")
@@ -1297,3 +1306,11 @@ def index() -> FileResponse:
 
 # Serve the static assets (index.html and anything alongside it).
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# ── Mobile (iOS) API — additive, default OFF (see web/mobile/) ────────────────
+# Registers the versioned /api/v2/* router only when MOBILE_API_ENABLED is set.
+# A no-op (and imports nothing further) otherwise, so the web app is unchanged.
+from web.mobile import include_mobile_api  # noqa: E402
+
+include_mobile_api(app)

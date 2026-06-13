@@ -101,11 +101,18 @@ class RobinhoodBroker:
     def has_saved_credentials(self) -> bool:
         return self.storage.has_tokens()
 
-    def connect(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+    def connect(self, timeout: Optional[float] = None, oauth_provider: Any = None) -> Dict[str, Any]:
         """Authorise (if needed) and load the MCP tool catalogue.
 
         First call may open a browser for OAuth consent. Returns a status dict;
-        does not raise on failure (the error is captured in the status)."""
+        does not raise on failure (the error is captured in the status).
+
+        ``oauth_provider`` is an optional, pre-built ``OAuthClientProvider``. When
+        omitted (the default desktop path) the broker builds the standard loopback
+        provider. The mobile/server-mediated flow
+        (``web/mobile/oauth_flow.py``) injects a provider whose redirect URI and
+        handlers drive a phone-based ``ASWebAuthenticationSession`` instead.
+        """
         if not ADAPTERS_AVAILABLE:
             self._connect_error = (
                 "langchain-mcp-adapters is not installed. "
@@ -117,7 +124,7 @@ class RobinhoodBroker:
             return self.status()
 
         try:
-            self._run(self._async_connect(), timeout=timeout or 300.0)
+            self._run(self._async_connect(oauth_provider=oauth_provider), timeout=timeout or 300.0)
             self._connected = True
             self._connect_error = None
         except Exception as exc:  # noqa: BLE001 — surface, don't crash callers
@@ -126,8 +133,8 @@ class RobinhoodBroker:
             logger.warning("Robinhood MCP connect failed: %s", exc)
         return self.status()
 
-    async def _async_connect(self) -> None:
-        auth = build_oauth_provider(
+    async def _async_connect(self, oauth_provider: Any = None) -> None:
+        auth = oauth_provider or build_oauth_provider(
             server_url=self.cfg.mcp_url,
             storage=self.storage,
             callback_port=self.cfg.oauth_callback_port,
@@ -291,6 +298,61 @@ class RobinhoodBroker:
             snapshot.raw["positions"] = rows
 
         return snapshot
+
+    def get_holdings(self) -> List[Dict[str, Any]]:
+        """Every equity position across *all* visible accounts (the real portfolio).
+
+        Unlike :meth:`get_account_snapshot` (scoped to the agentic trading
+        account), this reads positions from each account ``get_accounts`` returns
+        — including the main brokerage account that actually holds stock. Returns
+        normalized rows (symbol / quantity / average_buy_price / cost_basis plus a
+        masked ``account`` and ``agentic`` flag), sorted by cost basis. Read-only
+        and fail-open: any error yields an empty list.
+        """
+        if not self._connected:
+            return []
+        try:
+            return self._run(self._async_holdings())
+        except Exception as exc:  # noqa: BLE001 — never break the caller
+            logger.warning("Robinhood holdings fetch failed: %s", exc)
+            return []
+
+    async def _async_holdings(self) -> List[Dict[str, Any]]:
+        acc_tool = self._resolve_tool("accounts")
+        pos_tool = self._resolve_tool("positions")
+        if acc_tool is None or pos_tool is None:
+            return []
+        accounts = _envelope(_coerce_result(await acc_tool.ainvoke({})))
+        rows = accounts.get("accounts") if isinstance(accounts, dict) else accounts
+        rows = [r for r in (rows or []) if isinstance(r, dict)]
+        holdings: List[Dict[str, Any]] = []
+        for acc in rows:
+            number = acc.get("account_number") or acc.get("rhs_account_number")
+            if not number:
+                continue
+            masked = "…" + str(number)[-4:]
+            agentic = bool(acc.get("agentic_allowed"))
+            data = _envelope(_coerce_result(await pos_tool.ainvoke({"account_number": number})))
+            prows = data.get("positions") if isinstance(data, dict) else data
+            for pos in prows or []:
+                if not isinstance(pos, dict):
+                    continue
+                qty = _to_float(pos.get("quantity"))
+                if qty is None or qty <= 0:  # skip closed/zero lots
+                    continue
+                avg = _to_float(pos.get("average_buy_price") or pos.get("average_price"))
+                holdings.append(
+                    {
+                        "symbol": pos.get("symbol") or pos.get("ticker") or pos.get("instrument_symbol"),
+                        "quantity": qty,
+                        "average_buy_price": avg,
+                        "cost_basis": (qty * avg) if (qty is not None and avg is not None) else None,
+                        "account": masked,
+                        "agentic": agentic,
+                    }
+                )
+        holdings.sort(key=lambda h: (h.get("cost_basis") or 0), reverse=True)
+        return holdings
 
     # ── order placement / review ─────────────────────────────────────────
     def place_order(self, intent: OrderIntent) -> Tuple[Optional[str], Any]:
