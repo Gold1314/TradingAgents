@@ -154,6 +154,8 @@ class Run:
     order_placed: bool = False
     order_result: Optional[dict] = None
     order_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Requester analytics context (visitor/session/geo/device) for outcome events.
+    analytics: Optional[dict] = None
 
 
 class RunManager:
@@ -367,6 +369,8 @@ def _extract_event(node: str, delta: Any, merged: Optional[Dict[str, Any]] = Non
 
 def _run_pipeline(run: Run, req: RunRequest) -> None:
     """Worker-thread body: build the graph, stream it, persist, emit events."""
+    _t0 = time.time()
+    run_summary: Dict[str, Any] = {}
     try:
         config = DEFAULT_CONFIG.copy()
         if req.provider:
@@ -556,7 +560,8 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
 
         # Authoritative end-of-run breakdown + totals (covers any node we didn't
         # emit incrementally, e.g. an "Ungrouped" bucket).
-        manager.emit(run, {"type": "usage_summary", **usage.summary()})
+        run_summary = usage.summary()
+        manager.emit(run, {"type": "usage_summary", **run_summary})
 
         final_state = merged
         decision = ta.process_signal(final_state.get("final_trade_decision", ""))
@@ -602,6 +607,26 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
                 "decision": decision,
                 "content": final_state.get("final_trade_decision", ""),
             },
+        )
+
+        # Analytics: a run finished successfully (latency + token economics).
+        totals = (run_summary or {}).get("totals", {})
+        db.store_event(
+            {
+                **(run.analytics or {}),
+                "event_type": "run_completed",
+                "props": {
+                    "ticker": req.ticker,
+                    "asset_type": req.asset_type,
+                    "analysts": req.analysts,
+                    "provider": config.get("llm_provider"),
+                    "deep_model": config.get("deep_think_llm"),
+                    "decision": decision,
+                    "latency_ms": int((time.time() - _t0) * 1000),
+                    "total_tokens": totals.get("total_tokens"),
+                    "cost": totals.get("cost"),
+                },
+            }
         )
 
         # ── Robinhood execution (opt-in) ──────────────────────────────────
@@ -650,6 +675,18 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
         manager.emit(
             run,
             {"type": "error", "message": str(exc), "trace": traceback.format_exc()},
+        )
+        db.store_event(
+            {
+                **(run.analytics or {}),
+                "event_type": "run_failed",
+                "props": {
+                    "ticker": req.ticker,
+                    "asset_type": req.asset_type,
+                    "latency_ms": int((time.time() - _t0) * 1000),
+                    "error": str(exc)[:300],
+                },
+            }
         )
     finally:
         manager.emit(run, {"type": "done"})
@@ -839,14 +876,173 @@ async def place_order(run_id: str, body: PlaceOrderRequest) -> dict:
     )
 
 
+# Privacy: by default we store an anonymized IP (drop the last IPv4 octet /
+# zero the IPv6 host bits) — still useful for geo/abuse, far less identifying.
+# Set ANALYTICS_ANONYMIZE_IP=false to retain full IPs.
+_ANONYMIZE_IP = os.environ.get("ANALYTICS_ANONYMIZE_IP", "true").strip().lower() != "false"
+
+
+def _client_ip(request: Request) -> tuple[Optional[str], Optional[str]]:
+    """Best-effort client IP, proxy-aware. Returns (ip, raw_forwarded_for).
+
+    On Railway (and most PaaS) the app sits behind an edge proxy, so
+    ``request.client.host`` is the proxy. The real client is the first hop in
+    ``X-Forwarded-For``; we fall back to ``X-Real-IP`` then the socket peer.
+    """
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        ip = fwd.split(",")[0].strip()
+        return (ip or None), fwd
+    real = request.headers.get("x-real-ip")
+    if real:
+        return real.strip(), None
+    return (request.client.host if request.client else None), None
+
+
+def _anonymize_ip(ip: Optional[str]) -> Optional[str]:
+    """Mask the host portion: IPv4 keeps /24, IPv6 keeps /48."""
+    if not ip:
+        return ip
+    if "." in ip:  # IPv4
+        parts = ip.split(".")
+        if len(parts) == 4:
+            return ".".join(parts[:3] + ["0"])
+        return ip
+    if ":" in ip:  # IPv6 — keep first 3 hextets
+        segs = ip.split(":")
+        return ":".join(segs[:3]) + "::"
+    return ip
+
+
+def _parse_user_agent(ua: Optional[str]) -> Dict[str, Optional[str]]:
+    """Lightweight UA → {device_type, os, browser}. No external dependency."""
+    if not ua:
+        return {"device_type": None, "os": None, "browser": None}
+    low = ua.lower()
+    if any(b in low for b in ("bot", "spider", "crawler", "headless")):
+        device = "bot"
+    elif "ipad" in low or ("tablet" in low and "mobile" not in low):
+        device = "tablet"
+    elif any(m in low for m in ("mobi", "iphone", "android")):
+        device = "mobile"
+    else:
+        device = "desktop"
+    if "iphone" in low or "ipad" in low or "ios" in low:
+        os_name = "iOS"
+    elif "android" in low:
+        os_name = "Android"
+    elif "mac os" in low or "macintosh" in low:
+        os_name = "macOS"
+    elif "windows" in low:
+        os_name = "Windows"
+    elif "linux" in low:
+        os_name = "Linux"
+    else:
+        os_name = None
+    if "edg" in low:
+        browser = "Edge"
+    elif "chrome" in low or "crios" in low:
+        browser = "Chrome"
+    elif "firefox" in low or "fxios" in low:
+        browser = "Firefox"
+    elif "safari" in low:
+        browser = "Safari"
+    else:
+        browser = None
+    return {"device_type": device, "os": os_name, "browser": browser}
+
+
+def _geo_from_request(request: Request) -> Dict[str, Optional[str]]:
+    """Read geo from common CDN/edge headers (populated when fronted by
+    Cloudflare/Vercel/Fastly). No IP is sent to any third party; absent headers
+    simply yield None."""
+    h = request.headers
+    country = h.get("cf-ipcountry") or h.get("x-vercel-ip-country") or h.get("x-geo-country")
+    region = h.get("x-vercel-ip-country-region") or h.get("cf-region") or h.get("x-geo-region")
+    city = h.get("x-vercel-ip-city") or h.get("cf-ipcity") or h.get("x-geo-city")
+    return {
+        "country": (country or None),
+        "region": (region or None),
+        "city": (city or None),
+    }
+
+
+def _client_meta(request: Request) -> Dict[str, Any]:
+    """Unified, privacy-aware requester context for analytics rows."""
+    raw_ip, fwd = _client_ip(request)
+    ua = request.headers.get("user-agent")
+    meta: Dict[str, Any] = {
+        "ip_address": _anonymize_ip(raw_ip) if _ANONYMIZE_IP else raw_ip,
+        # forwarded_for holds full IPs; drop it when anonymizing.
+        "forwarded_for": None if _ANONYMIZE_IP else fwd,
+        "user_agent": ua,
+        "referrer": request.headers.get("referer"),
+        "language": (request.headers.get("accept-language") or "")[:40] or None,
+        "visitor_id": (request.headers.get("x-visitor-id") or "")[:64] or None,
+        "session_id": (request.headers.get("x-session-id") or "")[:64] or None,
+    }
+    meta.update(_parse_user_agent(ua))
+    meta.update(_geo_from_request(request))
+    return meta
+
+
+@app.post("/api/events")
+async def track_event(payload: Dict[str, Any], request: Request) -> dict:
+    """Record a client-side behavioral event (page_view, pdf_export, ...).
+
+    Fire-and-forget from the client's perspective; always returns ok. The
+    event_type and an optional props object come from the body; identity/geo are
+    enriched server-side from headers."""
+    event_type = str(payload.get("event_type") or "").strip()[:64]
+    if not event_type:
+        raise HTTPException(status_code=400, detail="event_type is required")
+    meta = _client_meta(request)
+    meta["event_type"] = event_type
+    props = payload.get("props")
+    meta["props"] = props if isinstance(props, dict) else None
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, db.store_event, meta)
+    return {"ok": True}
+
+
 @app.post("/api/runs")
-async def start_run(req: RunRequest) -> dict:
+async def start_run(req: RunRequest, request: Request) -> dict:
     if not req.ticker.strip():
         raise HTTPException(status_code=400, detail="ticker is required")
     if not req.analysts:
         raise HTTPException(status_code=400, detail="select at least one analyst")
 
     loop = asyncio.get_running_loop()
+
+    # Log who requested this analysis (fail-open; never blocks the run). Done
+    # before the cache check so cache hits are recorded too.
+    client_meta = _client_meta(request)
+    request_meta = {
+        **client_meta,
+        "ticker": req.ticker.strip().upper(),
+        "trade_date": req.trade_date,
+        "asset_type": req.asset_type,
+        "analysts": req.analysts,
+        "provider": req.provider,
+    }
+    await loop.run_in_executor(None, db.store_analysis_request, request_meta)
+    # Funnel event: an analysis was requested (mirrors the request log but lives
+    # in the unified event stream for retention/funnel queries).
+    await loop.run_in_executor(
+        None,
+        db.store_event,
+        {
+            **client_meta,
+            "event_type": "run_requested",
+            "props": {
+                "ticker": req.ticker.strip().upper(),
+                "asset_type": req.asset_type,
+                "analysts": req.analysts,
+                "provider": req.provider,
+                "forced": bool(req.force),
+            },
+        },
+    )
 
     # 60-minute cache: if enabled and a recent run exists, serve it instantly.
     if not req.force:
@@ -860,6 +1056,7 @@ async def start_run(req: RunRequest) -> dict:
 
     nodes = _planned_nodes(req.analysts)
     run = manager.create(loop, nodes)
+    run.analytics = client_meta  # carried into run_completed/run_failed events
     manager.emit(run, {"type": "nodes", "nodes": nodes})
 
     thread = threading.Thread(target=_run_pipeline, args=(run, req), daemon=True)

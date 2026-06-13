@@ -124,6 +124,82 @@ def store_run(meta: Dict[str, Any], agents: List[Dict[str, Any]]) -> Optional[st
         return None
 
 
+def store_analysis_request(meta: Dict[str, Any]) -> bool:
+    """Log a single analysis *request* (who asked for what) to analysis_requests.
+
+    Captures the requester IP / user agent / device / geo for every ``/api/runs``
+    call — even cache hits — so attempts are recorded regardless of run
+    completion. Fail-open like the rest of this module: a missing table or
+    unconfigured Supabase simply returns False and never blocks the analysis.
+    """
+    client = _get_client()
+    if client is None:
+        return False
+    try:
+        row = {
+            "ip_address": meta.get("ip_address"),
+            "forwarded_for": meta.get("forwarded_for"),
+            "user_agent": meta.get("user_agent"),
+            "ticker": meta.get("ticker"),
+            "trade_date": str(meta.get("trade_date")) if meta.get("trade_date") else None,
+            "asset_type": meta.get("asset_type"),
+            "analysts": meta.get("analysts"),
+            "provider": meta.get("provider"),
+            "visitor_id": meta.get("visitor_id"),
+            "session_id": meta.get("session_id"),
+            "country": meta.get("country"),
+            "region": meta.get("region"),
+            "city": meta.get("city"),
+            "device_type": meta.get("device_type"),
+            "os": meta.get("os"),
+            "browser": meta.get("browser"),
+            "referrer": meta.get("referrer"),
+            "language": meta.get("language"),
+        }
+        client.table("analysis_requests").insert(row).execute()
+        return True
+    except Exception as exc:  # noqa: BLE001 — logging must never block a run
+        logger.warning("store_analysis_request failed: %s", exc)
+        return False
+
+
+def store_event(meta: Dict[str, Any]) -> bool:
+    """Append one behavioral event (page_view, run_*, pdf_export, ...) to events.
+
+    The event stream powers acquisition / engagement / retention analytics. The
+    ``event_type`` is required; everything else is optional context (``props`` is
+    a free-form JSON blob). Fail-open: never blocks a request.
+    """
+    client = _get_client()
+    if client is None:
+        return False
+    event_type = meta.get("event_type")
+    if not event_type:
+        return False
+    try:
+        row = {
+            "event_type": event_type,
+            "visitor_id": meta.get("visitor_id"),
+            "session_id": meta.get("session_id"),
+            "props": meta.get("props"),
+            "ip_address": meta.get("ip_address"),
+            "country": meta.get("country"),
+            "region": meta.get("region"),
+            "city": meta.get("city"),
+            "device_type": meta.get("device_type"),
+            "os": meta.get("os"),
+            "browser": meta.get("browser"),
+            "referrer": meta.get("referrer"),
+            "language": meta.get("language"),
+            "user_agent": meta.get("user_agent"),
+        }
+        client.table("events").insert(row).execute()
+        return True
+    except Exception as exc:  # noqa: BLE001 — analytics must never block a request
+        logger.warning("store_event failed: %s", exc)
+        return False
+
+
 def get_recent_run(
     ticker: str, trade_date: str, within_minutes: int = 60
 ) -> Optional[Dict[str, Any]]:

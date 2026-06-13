@@ -296,6 +296,52 @@ let usageByNode = {}, usageTotals = null;  // run economics (tokens + est. cost)
 let activeRunId = null;  // current run id, mirrored into blueprint links for live watch
 const SESSION_KEY = "stockagents_active_run";
 
+// ── analytics: anonymous visitor/session identity + event tracking ──────────
+// visitor_id persists across visits (localStorage) to distinguish new vs
+// returning users; session_id is per-tab (sessionStorage). No PII is stored
+// client-side; the server enriches geo/device from request headers.
+const Analytics = (() => {
+  const uuid = () => (crypto.randomUUID ? crypto.randomUUID()
+    : "xxxxxxxxxxxx4xxxyxxx".replace(/[xy]/g, c => {
+        const r = Math.random()*16|0; return (c==="x"?r:(r&0x3|0x8)).toString(16); }));
+  let vid;
+  try {
+    vid = localStorage.getItem("sa_visitor_id");
+    if(!vid){ vid = uuid(); localStorage.setItem("sa_visitor_id", vid); }
+  } catch { vid = uuid(); }
+  let sid;
+  try {
+    sid = sessionStorage.getItem("sa_session_id");
+    if(!sid){ sid = uuid(); sessionStorage.setItem("sa_session_id", sid); }
+  } catch { sid = uuid(); }
+  const headers = () => ({ "X-Visitor-Id": vid, "X-Session-Id": sid });
+  const track = (eventType, props) => {
+    try {
+      fetch("/api/events", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...headers() },
+        body: JSON.stringify({ event_type: eventType, props: props || {} }),
+        keepalive: true,
+      }).catch(()=>{});
+    } catch {}
+  };
+  return { visitorId: vid, sessionId: sid, headers, track };
+})();
+
+// Acquisition: capture referrer + UTM params on first load of the session.
+(function trackPageView(){
+  const params = new URLSearchParams(location.search);
+  const utm = {};
+  ["utm_source","utm_medium","utm_campaign","utm_term","utm_content"].forEach(k=>{
+    const v = params.get(k); if(v) utm[k] = v.slice(0,120);
+  });
+  Analytics.track("page_view", {
+    path: location.pathname,
+    referrer: document.referrer || null,
+    ...utm,
+  });
+})();
+
 function getFormState(){
   return {
     ticker: $("ticker").value.trim().toUpperCase(),
@@ -466,7 +512,7 @@ async function connectRobinhood(){
     const res=await fetch("/api/robinhood/connect",{method:"POST"});
     const st=await res.json();
     if(!res.ok){ rhBadge(false,"Robinhood · failed"); alert((st&&st.detail)||"Connect failed"); }
-    else{ rhConfig=st; if(st.connected){ rhBadge(true, rhBadgeLabel(st)); } else { rhBadge(false,"Robinhood · connect"); if(st.error) alert(st.error); } }
+    else{ rhConfig=st; Analytics.track("robinhood_connect",{connected:!!st.connected}); if(st.connected){ rhBadge(true, rhBadgeLabel(st)); } else { rhBadge(false,"Robinhood · connect"); if(st.error) alert(st.error); } }
   }catch(e){ rhBadge(false,"Robinhood · error"); }
   finally{ btn.disabled=false; if(btn.innerHTML.includes("authorizing")) btn.innerHTML=prev; }
 }
@@ -911,7 +957,7 @@ async function startRun(force){
   $("run-form").classList.add("hidden"); $("run-summary").classList.remove("hidden");
 
   let res;
-  try{ res=await fetch("/api/runs",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); }
+  try{ res=await fetch("/api/runs",{method:"POST",headers:{"Content-Type":"application/json",...Analytics.headers()},body:JSON.stringify(body)}); }
   catch{ showError("Could not reach the server. Is it running?"); $("run-btn").disabled=false; $("new-run").disabled=false; statusPill("error","#f43f5e"); return; }
   if(!res.ok){ const err=await res.json().catch(()=>({})); showError((err.detail&&JSON.stringify(err.detail))||`Request failed (${res.status})`); $("run-btn").disabled=false; $("new-run").disabled=false; statusPill("error","#f43f5e"); return; }
   const data=await res.json();
@@ -1024,6 +1070,7 @@ function findCutRow(ctx, width, targetEnd, minY){
 
 async function downloadPDF(){
   if(!currentParams || !window.html2canvas || !(window.jspdf && window.jspdf.jsPDF)) return;
+  Analytics.track("pdf_export", { ticker: currentParams.ticker, run_id: activeRunId });
   const btn=$("download-pdf"); const label=btn.textContent;
   btn.disabled=true; btn.textContent="Preparing…";
   let holder=null;
