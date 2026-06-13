@@ -84,6 +84,7 @@
       <div id="timer" class="hidden text-sm font-mono text-slate-400 tabular-nums">0.0s</div>
       <div id="status-pill" class="text-xs px-3 py-1.5 rounded-full bg-slate-800/80 text-slate-400 border border-slate-700">idle</div>
       <a href="/blueprint" data-blueprint-link target="_blank" rel="noopener" title="Agent graph blueprint (opens new tab)" class="text-xs px-3 py-1.5 rounded-lg border border-slate-700 hover:border-sky-400 text-slate-400 hover:text-sky-300 transition hidden sm:inline-flex items-center gap-1">🗺️ Blueprint</a>
+      <button id="rh-btn" title="Robinhood connection" class="hidden text-xs px-3 py-1.5 rounded-lg border border-slate-700 hover:border-emerald-400 text-slate-300 transition items-center gap-1.5">🪶 Robinhood</button>
       <button id="admin-btn" title="Admin settings" class="w-9 h-9 rounded-lg border border-slate-700 bg-slate-900/60 hover:border-slate-500 text-slate-400 hover:text-slate-200 transition flex items-center justify-center">⚙</button>
     </div>
   </header>
@@ -168,6 +169,18 @@
         </div>
       </div>
     </div>
+  </section>
+
+  <!-- ░░ Robinhood auto-trade ░░ -->
+  <section id="trade-panel" class="hidden bg-slate-900/70 backdrop-blur border rounded-2xl p-5 mb-6 shadow-xl shadow-black/20">
+    <div class="flex items-center justify-between gap-3 flex-wrap mb-3">
+      <div class="flex items-center gap-2">
+        <span class="text-sm font-semibold text-emerald-300">🪶 Robinhood execution</span>
+        <span id="trade-mode" class="text-[10px] uppercase tracking-wide px-2 py-0.5 rounded-full border"></span>
+      </div>
+      <div id="trade-account" class="text-[11px] text-slate-400 tabular-nums"></div>
+    </div>
+    <div id="trade-body" class="text-sm text-slate-300"></div>
   </section>
 
   <!-- ░░ Run economics (tokens & estimated cost) ░░ -->
@@ -412,7 +425,149 @@ async function loadConfig() {
   document.querySelectorAll("#analysts input, #max_debate_rounds, #max_risk_rounds").forEach((el)=>{
     el.addEventListener("change", updateBlueprintLinks);
   });
+  initRobinhood(cfg.robinhood);
   await tryRestoreActiveRun();
+}
+
+// ── Robinhood integration ───────────────────────────────────────────────────
+let rhConfig=null;
+function initRobinhood(rh){
+  rhConfig=rh||null;
+  const btn=$("rh-btn");
+  if(!rh || !rh.enabled){ btn.classList.add("hidden"); return; }
+  btn.classList.remove("hidden"); btn.classList.add("inline-flex");
+  refreshRobinhoodStatus();
+  btn.onclick=connectRobinhood;
+}
+function rhBadgeLabel(st){
+  if(st.can_place_real_orders) return "Robinhood · LIVE";
+  const mode=st.trade_mode||"manual";
+  return mode==="off" ? "Robinhood · grounding" : `Robinhood · ${mode}`;
+}
+function rhBadge(connected, label){
+  const btn=$("rh-btn");
+  const color=connected?"#34d399":"#fbbf24";
+  btn.style.borderColor=tint(color,.5); btn.style.color=color;
+  btn.innerHTML=`🪶 ${label}`;
+}
+async function refreshRobinhoodStatus(){
+  if(!rhConfig||!rhConfig.enabled) return;
+  try{
+    const st=await (await fetch("/api/robinhood/status")).json();
+    rhConfig=st;
+    if(st.connected){ rhBadge(true, rhBadgeLabel(st)); }
+    else { rhBadge(false,"Robinhood · connect"); }
+  }catch{ rhBadge(false,"Robinhood"); }
+}
+async function connectRobinhood(){
+  const btn=$("rh-btn"); const prev=btn.innerHTML;
+  rhBadge(false,"Robinhood · authorizing…"); btn.disabled=true;
+  try{
+    const res=await fetch("/api/robinhood/connect",{method:"POST"});
+    const st=await res.json();
+    if(!res.ok){ rhBadge(false,"Robinhood · failed"); alert((st&&st.detail)||"Connect failed"); }
+    else{ rhConfig=st; if(st.connected){ rhBadge(true, rhBadgeLabel(st)); } else { rhBadge(false,"Robinhood · connect"); if(st.error) alert(st.error); } }
+  }catch(e){ rhBadge(false,"Robinhood · error"); }
+  finally{ btn.disabled=false; if(btn.innerHTML.includes("authorizing")) btn.innerHTML=prev; }
+}
+function fmtUsd(v){ return (v==null)?"—":"$"+Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function showAccount(ev){
+  const panel=$("trade-panel");
+  if(!ev.connected){
+    panel.classList.remove("hidden"); panel.style.borderColor=tint("#fbbf24",.4);
+    $("trade-mode").textContent="not connected"; $("trade-mode").style.color="#fbbf24"; $("trade-mode").style.borderColor=tint("#fbbf24",.5);
+    $("trade-account").textContent=""; $("trade-body").innerHTML=`<span class="text-amber-300">${ev.message||"Robinhood not connected."}</span>`;
+    return;
+  }
+  panel.classList.remove("hidden");
+  const pos=ev.position;
+  const qty=pos?(pos.quantity||pos.qty||pos.shares):null;
+  $("trade-account").textContent=`Buying power ${fmtUsd(ev.buying_power)} · Portfolio ${fmtUsd(ev.portfolio_value)}${qty?` · Holds ${qty} sh`:""}`;
+}
+const TRADE_STYLE={
+  proposed:{c:"#eab308",t:"awaiting your click"}, placed:{c:"#34d399",t:"order placed"},
+  dry_run:{c:"#38bdf8",t:"dry run"}, skipped:{c:"#94a3b8",t:"no action"},
+  disabled:{c:"#64748b",t:"disabled"}, error:{c:"#f43f5e",t:"error"},
+};
+let pendingProposal=null;
+function tradeBadge(text,color){ const m=$("trade-mode"); m.textContent=text; m.style.color=color; m.style.borderColor=tint(color,.5); }
+function intentLine(intent,color){
+  const size = intent.notional!=null ? fmtUsd(intent.notional) : `${intent.quantity} sh`;
+  return `<div class="text-base font-semibold" style="color:${color}">${intent.action.toUpperCase()} ${intent.ticker} · ${size} <span class="text-xs font-normal text-slate-400">(${intent.order_type})</span></div>`;
+}
+function showTrade(ev){
+  const panel=$("trade-panel"); panel.classList.remove("hidden");
+  if(ev.status==="proposed" && ev.intent && ev.intent.action!=="none"){ renderProposedTicket(ev); return; }
+  const st=TRADE_STYLE[ev.status]||{c:"#94a3b8",t:ev.status||"—"};
+  panel.style.borderColor=tint(st.c,.45);
+  tradeBadge(ev.can_place_real_orders && ev.status!=="dry_run" ? "LIVE · real money" : st.t, st.c);
+  const intent=ev.intent;
+  let html="";
+  html += (intent && intent.action!=="none") ? intentLine(intent,st.c)
+        : `<div class="text-base font-semibold" style="color:${st.c}">${st.t.toUpperCase()}</div>`;
+  if(ev.order_id) html += `<div class="text-xs text-slate-400 mt-1">Order ID: <span class="font-mono">${ev.order_id}</span></div>`;
+  if(ev.message) html += `<div class="text-xs text-slate-400 mt-1">${ev.message}</div>`;
+  if(intent && intent.reason && intent.reason!==ev.message) html += `<div class="text-[11px] text-slate-500 mt-1">${intent.reason}</div>`;
+  $("trade-body").innerHTML=html;
+  // After a rehearsal (dry run) or a recoverable error, let them adjust and retry.
+  if((ev.status==="dry_run"||ev.status==="error") && pendingProposal){ appendTicket(pendingProposal); }
+  if(ev.status==="placed") pendingProposal=null;
+}
+function renderProposedTicket(ev){
+  pendingProposal=ev;
+  const panel=$("trade-panel"); panel.style.borderColor=tint("#eab308",.5);
+  tradeBadge(ev.dry_run ? "rehearsal · dry run" : (ev.can_place_real_orders ? "LIVE · real money" : "ready to place"), ev.dry_run?"#38bdf8":(ev.can_place_real_orders?"#f59e0b":"#34d399"));
+  $("trade-body").innerHTML = `<div class="text-base font-semibold text-amber-300 mb-1">Proposed order — review &amp; place</div>
+    <div class="text-[11px] text-slate-500 mb-3" id="ord-reason">${ev.intent.reason||""}</div>
+    <div id="ord-ticket"></div>`;
+  appendTicket(ev);
+}
+function appendTicket(ev){
+  const intent=ev.intent; const host=$("trade-body").querySelector("#ord-ticket")||$("trade-body");
+  const placeLabel = ev.dry_run ? "Simulate (dry run)" : (ev.can_place_real_orders ? "Place LIVE order" : "Place order");
+  const placeColor = ev.dry_run ? "#38bdf8" : (ev.can_place_real_orders ? "#f59e0b" : "#34d399");
+  const inp="w-full bg-slate-950/60 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-emerald-400";
+  host.innerHTML = `<div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+      <div><label class="block text-[10px] uppercase tracking-wide text-slate-500 mb-1">Side</label>
+        <select id="ord-action" class="${inp}"><option value="buy">Buy</option><option value="sell">Sell</option></select></div>
+      <div data-buy><label class="block text-[10px] uppercase tracking-wide text-slate-500 mb-1">Amount (USD)</label>
+        <input id="ord-notional" type="number" min="0" step="1" class="${inp}" value="${intent.notional??""}"></div>
+      <div data-sell><label class="block text-[10px] uppercase tracking-wide text-slate-500 mb-1">Quantity (sh)</label>
+        <input id="ord-qty" type="number" min="0" step="0.000001" class="${inp}" value="${intent.quantity??""}"></div>
+      <div><label class="block text-[10px] uppercase tracking-wide text-slate-500 mb-1">Type</label>
+        <select id="ord-type" class="${inp}"><option value="market">market</option><option value="limit">limit</option></select></div>
+    </div>
+    <div class="flex items-center gap-2 mt-3">
+      <button id="ord-place" class="px-4 py-2 rounded-lg font-bold text-slate-950 text-sm transition active:scale-95" style="background:${placeColor}">${placeLabel}</button>
+      <button id="ord-skip" class="px-3 py-2 rounded-lg border border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-500 text-sm transition">Skip</button>
+      <span id="ord-status" class="text-xs text-slate-500"></span>
+    </div>`;
+  const actionSel=host.querySelector("#ord-action"); actionSel.value=intent.action;
+  const typeSel=host.querySelector("#ord-type"); typeSel.value=intent.order_type||"market";
+  const syncSide=()=>{ const buy=actionSel.value==="buy"; host.querySelector("[data-buy]").style.display=buy?"":"none"; host.querySelector("[data-sell]").style.display=buy?"none":""; };
+  actionSel.addEventListener("change",syncSide); syncSide();
+  host.querySelector("#ord-skip").onclick=()=>{ pendingProposal=null; tradeBadge("skipped","#94a3b8"); $("trade-body").innerHTML=`<div class="text-sm text-slate-400">Order skipped. No trade placed.</div>`; };
+  host.querySelector("#ord-place").onclick=()=>placeProposedOrder(ev);
+}
+async function placeProposedOrder(ev){
+  if(!activeRunId){ alert("No active run to place an order for."); return; }
+  const host=$("trade-body");
+  const action=host.querySelector("#ord-action").value;
+  const edits={ action, order_type:host.querySelector("#ord-type").value };
+  if(action==="buy") edits.notional=parseFloat(host.querySelector("#ord-notional").value)||0;
+  else edits.quantity=parseFloat(host.querySelector("#ord-qty").value)||0;
+  if(ev.can_place_real_orders){
+    const size=action==="buy"?fmtUsd(edits.notional):`${edits.quantity} sh`;
+    if(!confirm(`Place a LIVE ${action.toUpperCase()} order for ${ev.intent.ticker} (${size})?\n\nThis uses REAL money and cannot be undone here.`)) return;
+  }
+  const place=host.querySelector("#ord-place"), stat=host.querySelector("#ord-status");
+  if(place) place.disabled=true; if(stat) stat.textContent="placing…";
+  try{
+    const res=await fetch(`/api/robinhood/orders/${activeRunId}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(edits)});
+    const data=await res.json();
+    if(!res.ok){ showTrade({status:"error",message:(data.detail||"placement failed"),intent:ev.intent,can_place_real_orders:ev.can_place_real_orders,dry_run:ev.dry_run}); }
+    else { showTrade(data); }
+  }catch(e){ showTrade({status:"error",message:"Could not reach the server.",intent:ev.intent,dry_run:ev.dry_run}); }
 }
 
 // ── stepper ───────────────────────────────────────────────────────────────
@@ -678,6 +833,8 @@ function handleEvent(ev){
     case "usage": usageByNode[ev.node]=ev; renderEconomics(); break;
     case "usage_summary": if(ev.nodes) usageByNode=ev.nodes; usageTotals=ev.totals||null; renderEconomics(); break;
     case "final": showVerdict(ev.decision,ev.content); break;
+    case "account": showAccount(ev); break;
+    case "trade": showTrade(ev); refreshRobinhoodStatus(); break;
     case "error": statusPill("error","#f43f5e"); showError(ev.message); break;
     case "done":
       plannedNodes.forEach((n)=>setNodeState(n,"done"));
@@ -699,6 +856,7 @@ function resetUI(){
   cardEls={}; sectionEls={}; marketChartEl=null; $("empty").classList.add("hidden");
   $("download-pdf").classList.add("hidden");
   usageByNode={}; usageTotals=null; $("economics").classList.add("hidden");
+  $("trade-panel").classList.add("hidden"); $("trade-body").innerHTML=""; $("trade-account").textContent=""; $("trade-mode").textContent="";
 }
 
 // ── cached render (60-minute cache hit) ─────────────────────────────────────

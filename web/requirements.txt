@@ -4,3 +4,6 @@ uvicorn[standard]>=0.29
 # Optional: persistence + 60-min cache. The app runs fine without Supabase
 # configured (storage/cache simply no-op until SUPABASE_URL/KEY are set).
 supabase>=2.4
+# Robinhood Trading MCP integration (opt-in; only used when
+# TRADINGAGENTS_ROBINHOOD_ENABLED=true). Pulls in the official `mcp` SDK.
+langchain-mcp-adapters>=0.3.0

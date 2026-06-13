@@ -265,6 +265,70 @@ ta = TradingAgentsGraph(config=config)
 _, decision = ta.propagate("NVDA", "2026-01-15")
 ```
 
+## Live trading via the Robinhood MCP
+
+TradingAgents can connect to your **Robinhood Agentic** account through the
+[Robinhood Trading MCP](https://robinhood.com/us/en/support/articles/agentic-trading-overview/)
+(`https://agent.robinhood.com/mcp/trading`). This is an **additive, opt-in**
+layer in `tradingagents/brokers/` — with it disabled (the default) nothing
+changes. When enabled it can:
+
+- **Ground the agents** in your *real* account: live buying power and your
+  existing position in the ticker are injected into every agent's context, so
+  sizing and the final rating reflect what you actually hold.
+- **Trade**: translate the Portfolio Manager's 5-tier rating into an order
+  (Buy/Overweight → buy, Sell/Underweight → trim/exit, Hold → no-op) and place
+  it via the MCP — either on a button click (manual) or automatically (auto).
+
+### Trade modes
+
+`TRADINGAGENTS_ROBINHOOD_TRADE_MODE` selects how a rating becomes an order:
+
+| Mode | Behaviour |
+| --- | --- |
+| `off` | Grounding only — never computes or places an order. |
+| `manual` *(default)* | Proposes the order after the run; **you place it** via the **Place order** button in the UI. The click is your confirmation, and you can edit side / size / order type first. |
+| `auto` | Places the order automatically right after the verdict, with no per-trade confirmation. |
+
+### Safety model
+
+Nothing trades until you opt in on **two** axes — feature on, and a mode that
+isn't `off` — and **no real money moves while `DRY_RUN=true`**:
+
+| Gate | Env var | Default |
+| --- | --- | --- |
+| Feature on | `TRADINGAGENTS_ROBINHOOD_ENABLED` | `false` |
+| Execution behaviour | `TRADINGAGENTS_ROBINHOOD_TRADE_MODE` | `manual` |
+| Simulate only (no real order) | `TRADINGAGENTS_ROBINHOOD_DRY_RUN` | `true` |
+
+A **real** order is placed only when `ENABLED=true`, `TRADE_MODE` is `manual`
+(on click) or `auto`, **and** `DRY_RUN=false`. Orders are always re-clamped
+server-side to `TRADINGAGENTS_ROBINHOOD_MAX_ORDER_NOTIONAL` and your available
+buying power, and a sell never exceeds the shares actually held. Placement is
+idempotent (a double-click can't fire twice). See `.env.example` for all vars.
+
+> ⚠️ In `auto` mode with `DRY_RUN=false`, the app places **real orders with real
+> money automatically and without per-trade confirmation**. You are responsible
+> for every trade your agent places. Start with `DRY_RUN=true` to rehearse.
+
+### Web app usage
+
+1. Set the env vars above (at minimum `TRADINGAGENTS_ROBINHOOD_ENABLED=true`) and
+   start the web app.
+2. A **🪶 Robinhood** button appears in the header — click it to authorize via
+   OAuth in your browser (tokens are cached at
+   `~/.tradingagents/robinhood_token.json`, which is git-ignored).
+3. Run an analysis. The **Robinhood execution** panel shows your account context
+   and the order:
+   - In **manual** mode you get an editable ticket with **Place order** / **Skip**
+     buttons (a confirmation dialog appears only for LIVE real-money orders).
+   - In **auto** mode the resulting order (or a `DRY RUN` preview) is shown
+     immediately.
+
+Requires `langchain-mcp-adapters` (installed automatically with the project).
+Robinhood only allows trades in a dedicated **Agentic** account, which you set up
+during the MCP onboarding.
+
 ## Reproducibility
 
 TradingAgents is LLM-driven, so two runs of the same ticker and date can differ. This is expected for a research tool built on language models, not a defect. The variation comes from a few distinct sources, and it helps to separate them.

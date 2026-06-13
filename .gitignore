@@ -221,3 +221,7 @@ __marimo__/
 # Enterprise env file (secrets) and generated run reports
 .env.enterprise
 reports/
+
+# Robinhood MCP OAuth token cache (secret — never commit)
+robinhood_token.json
+**/robinhood_token.json

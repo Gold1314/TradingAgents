@@ -40,6 +40,14 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from tradingagents.brokers import (
+    AutoTradeExecutor,
+    ExecutionResult,
+    OrderIntent,
+    RobinhoodBroker,
+    build_account_context,
+    load_robinhood_config,
+)
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.checkpointer import clear_checkpoint, thread_id
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -115,6 +123,17 @@ class CacheToggle(BaseModel):
     enabled: bool
 
 
+class PlaceOrderRequest(BaseModel):
+    """Edits to a proposed order ticket (manual mode). All fields optional —
+    omitted fields fall back to the agent's proposed values. The ticker is
+    intentionally NOT accepted: an order can only target the run's own ticker."""
+
+    action: Optional[str] = None
+    quantity: Optional[float] = None
+    notional: Optional[float] = None
+    order_type: Optional[str] = None
+
+
 RUN_RETENTION_SECONDS = 3600  # keep finished runs for replay / reconnect
 
 
@@ -127,6 +146,14 @@ class Run:
     event_log: List[dict] = field(default_factory=list)
     done: threading.Event = field(default_factory=threading.Event)
     finished_at: Optional[float] = None
+    # Manual-mode order awaiting a "Place order" click. ``pending_order`` holds
+    # the proposed OrderIntent (as a dict); ``order_lock`` + ``order_placed``
+    # make placement idempotent so a double-click can't fire two orders.
+    pending_order: Optional[dict] = None
+    order_ticker: Optional[str] = None
+    order_placed: bool = False
+    order_result: Optional[dict] = None
+    order_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class RunManager:
@@ -169,6 +196,82 @@ class RunManager:
 
 
 manager = RunManager()
+
+
+# ── Robinhood broker (lazy singleton) ─────────────────────────────────────────
+# One broker per process: OAuth tokens are cached, and a single connection is
+# reused across runs. Created lazily so the server starts fine when the feature
+# is disabled or the optional MCP deps are missing.
+_broker_lock = threading.Lock()
+_broker: Optional[RobinhoodBroker] = None
+
+
+def get_broker() -> RobinhoodBroker:
+    global _broker
+    with _broker_lock:
+        if _broker is None:
+            _broker = RobinhoodBroker(load_robinhood_config(DEFAULT_CONFIG))
+        return _broker
+
+
+def _trade_event(result: ExecutionResult, cfg) -> dict:
+    return {
+        "type": "trade",
+        "trade_mode": cfg.trade_mode,
+        "can_place_real_orders": cfg.can_place_real_orders,
+        "dry_run": cfg.dry_run,
+        **result.to_dict(),
+    }
+
+
+def _place_pending_order(run: "Run", body: PlaceOrderRequest, cfg) -> dict:
+    """Place the run's proposed order (manual mode), applying any ticket edits.
+
+    Runs in a thread (blocking MCP call). Idempotent: a real placement locks the
+    run so a double-click returns the first result instead of firing twice.
+    Re-clamping happens inside the executor against a fresh account snapshot.
+    """
+    with run.order_lock:
+        if run.order_placed and run.order_result:
+            return run.order_result  # already placed — return the first result
+
+        # Start from the agent's proposal; overlay only the provided edits.
+        # The ticker is forced to the run's own ticker (never client-supplied).
+        intent_dict = dict(run.pending_order or {})
+        intent_dict["ticker"] = run.order_ticker
+        if body.action:
+            intent_dict["action"] = body.action
+        if body.order_type:
+            intent_dict["order_type"] = body.order_type
+        if body.quantity is not None:
+            intent_dict["quantity"] = body.quantity
+        if body.notional is not None:
+            intent_dict["notional"] = body.notional
+
+        intent = OrderIntent.from_dict(intent_dict)
+        # One sizing field per action: buys use notional, sells use quantity.
+        if intent.action == "buy":
+            intent.quantity = None
+        elif intent.action == "sell":
+            intent.notional = None
+
+        broker = get_broker()
+        if not broker.is_connected and broker.has_saved_credentials():
+            broker.connect()
+        if not broker.is_connected:
+            result = ExecutionResult(
+                status="error", intent=intent, message="Robinhood not connected."
+            )
+        else:
+            snapshot = broker.get_account_snapshot()
+            result = AutoTradeExecutor(broker, cfg).execute_intent(intent, snapshot)
+
+        payload = _trade_event(result, cfg)
+        if result.status == "placed":
+            run.order_placed = True
+            run.order_result = payload
+        manager.emit(run, payload)  # record for replay / other tabs
+        return payload
 
 
 def _planned_nodes(analysts: List[str]) -> List[str]:
@@ -320,6 +423,47 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
 
         instrument_context = ta.resolve_instrument_context(req.ticker, req.asset_type)
         manager.emit(run, {"type": "memory", "phase": "identity", "status": "done"})
+
+        # ── Robinhood grounding (opt-in) ──────────────────────────────────
+        # When enabled and already authorised, fold the user's real buying
+        # power and existing position into the context every agent sees. Never
+        # blocks or fails the run; a broker hiccup just means no grounding.
+        rh_cfg = load_robinhood_config(config)
+        account_snapshot = None
+        if rh_cfg.enabled and (rh_cfg.grounding_enabled or rh_cfg.executes_orders):
+            try:
+                broker = get_broker()
+                if not broker.is_connected and broker.has_saved_credentials():
+                    broker.connect()
+                if broker.is_connected:
+                    account_snapshot = broker.get_account_snapshot()
+                    if rh_cfg.grounding_enabled:
+                        acct_ctx = build_account_context(account_snapshot, req.ticker)
+                        if acct_ctx.strip():
+                            instrument_context = f"{instrument_context}\n{acct_ctx}"
+                    manager.emit(
+                        run,
+                        {
+                            "type": "account",
+                            "connected": True,
+                            "buying_power": account_snapshot.buying_power,
+                            "portfolio_value": account_snapshot.portfolio_value,
+                            "position": account_snapshot.position_for(req.ticker),
+                        },
+                    )
+                else:
+                    manager.emit(
+                        run,
+                        {
+                            "type": "account",
+                            "connected": False,
+                            "message": "Robinhood enabled but not connected. "
+                            "Use Connect to authorize.",
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001 — grounding is best-effort
+                logger.warning("robinhood grounding failed: %s", exc)
+
         manager.emit(run, {"type": "identity", "content": instrument_context})
 
         init_state = ta.propagator.create_initial_state(
@@ -459,6 +603,48 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
                 "content": final_state.get("final_trade_decision", ""),
             },
         )
+
+        # ── Robinhood execution (opt-in) ──────────────────────────────────
+        # Translate the rating into an order. In "manual" mode this only
+        # *proposes* the order (the UI places it on a button click); in "auto"
+        # mode it places immediately. dry_run simulates in either case; a real
+        # order needs trade_mode in {manual,auto} AND dry_run=False.
+        if rh_cfg.executes_orders:
+            try:
+                broker = get_broker()
+                if broker.is_connected:
+                    result = AutoTradeExecutor(broker, rh_cfg).execute(
+                        decision, req.ticker, account_snapshot
+                    )
+                    # Stash a proposed order so the button can place it later.
+                    if result.status == "proposed" and result.intent is not None:
+                        run.pending_order = result.intent.to_dict()
+                        run.order_ticker = req.ticker
+                    manager.emit(
+                        run,
+                        {
+                            "type": "trade",
+                            "trade_mode": rh_cfg.trade_mode,
+                            "can_place_real_orders": rh_cfg.can_place_real_orders,
+                            "dry_run": rh_cfg.dry_run,
+                            **result.to_dict(),
+                        },
+                    )
+                else:
+                    manager.emit(
+                        run,
+                        {
+                            "type": "trade",
+                            "status": "error",
+                            "message": "Robinhood not connected — connect first.",
+                        },
+                    )
+            except Exception as exc:  # noqa: BLE001 — never fail the response
+                logger.exception("trade execution failed")
+                manager.emit(
+                    run,
+                    {"type": "trade", "status": "error", "message": str(exc)},
+                )
     except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
         logger.exception("run failed")
         manager.emit(
@@ -601,7 +787,56 @@ def get_config() -> dict:
         "supabase_configured": db.is_configured(),
         "admin_available": bool(ADMIN_PASSWORD),
         "cache_window_minutes": CACHE_WINDOW_MINUTES,
+        "robinhood": load_robinhood_config(DEFAULT_CONFIG).public_status(),
     }
+
+
+@app.get("/api/robinhood/status")
+async def robinhood_status() -> dict:
+    """Current Robinhood integration state (config gates + connection)."""
+    cfg = load_robinhood_config(DEFAULT_CONFIG)
+    if not cfg.enabled:
+        # Don't construct/connect a broker when the feature is off.
+        return {**cfg.public_status(), "connected": False, "available": True}
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: get_broker().status())
+
+
+@app.post("/api/robinhood/connect")
+async def robinhood_connect() -> dict:
+    """Authorize the Robinhood MCP (opens a browser for OAuth on first use).
+
+    Blocking OAuth/handshake work runs in the thread pool so the event loop
+    stays responsive. Returns the resulting status (never raises on auth
+    failure — the error is reported in the payload)."""
+    cfg = load_robinhood_config(DEFAULT_CONFIG)
+    if not cfg.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="Robinhood integration is disabled. Set TRADINGAGENTS_ROBINHOOD_ENABLED=true.",
+        )
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: get_broker().connect())
+
+
+@app.post("/api/robinhood/orders/{run_id}")
+async def place_order(run_id: str, body: PlaceOrderRequest) -> dict:
+    """Place the order proposed by a finished run (manual mode, button click).
+
+    Applies optional ticket edits, re-clamps server-side, honors dry_run, and is
+    idempotent. Blocking broker work runs in the thread pool."""
+    cfg = load_robinhood_config(DEFAULT_CONFIG)
+    if not cfg.enabled or cfg.trade_mode == "off":
+        raise HTTPException(status_code=409, detail="Robinhood execution is off.")
+    run = manager.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="unknown or expired run")
+    if not run.pending_order:
+        raise HTTPException(status_code=409, detail="no pending order for this run")
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: _place_pending_order(run, body, cfg)
+    )
 
 
 @app.post("/api/runs")

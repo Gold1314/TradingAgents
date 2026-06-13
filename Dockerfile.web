@@ -31,6 +31,8 @@ WORKDIR /home/appuser/app
 
 COPY --from=builder --chown=appuser:appuser /build .
 
-# Bind to Railway's injected $PORT (falls back to 8000 locally). Single worker:
-# run state (the SSE run registry) lives in process memory.
-CMD ["sh", "-c", "python -m uvicorn web.server:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Entrypoint seeds the Robinhood OAuth token from $ROBINHOOD_TOKEN_JSON (if set,
+# for headless PaaS where the browser OAuth flow can't run) and then binds
+# Railway's injected $PORT (falls back to 8000 locally). Single worker: the SSE
+# run registry lives in process memory.
+ENTRYPOINT ["sh", "web/entrypoint.sh"]

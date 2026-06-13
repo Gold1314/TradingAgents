@@ -115,6 +115,33 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # so the reflection label keeps reading "Alpha vs SPY" for US tickers
     # while non-US tickers get their regional index automatically.
     "benchmark_ticker": None,
+    # Robinhood Trading MCP integration (additive, opt-in, OFF by default).
+    # See tradingagents/brokers/config.py for the full schema and the
+    # TRADINGAGENTS_ROBINHOOD_* env overrides. trade_mode selects execution:
+    # "off" (grounding only) | "manual" (place via UI button) | "auto" (fire
+    # after the verdict). A *real* order requires dry_run=False as well.
+    # Endpoint is the public Robinhood MCP URL; no secrets live here (OAuth
+    # tokens are cached separately at token_storage_path).
+    "robinhood": {
+        "enabled": False,
+        "mcp_url": "https://agent.robinhood.com/mcp/trading",
+        "grounding_enabled": True,
+        "trade_mode": "manual",
+        "dry_run": True,
+        "max_order_notional": 1000.0,
+        "default_order_notional": 100.0,
+        "order_type": "market",
+        "token_storage_path": os.path.join(_TRADINGAGENTS_HOME, "robinhood_token.json"),
+        "oauth_callback_port": 8765,
+        "tool_overrides": {
+            "accounts": "get_accounts",
+            "portfolio": "get_portfolio",
+            "positions": "get_equity_positions",
+            "place_order": "place_equity_order",
+            "review_order": "review_equity_order",
+        },
+        "request_timeout": 60.0,
+    },
     "benchmark_map": {
         ".NS":  "^NSEI",       # NSE India (Nifty 50)
         ".BO":  "^BSESN",      # BSE India (Sensex)
