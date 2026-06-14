@@ -23,7 +23,7 @@ import os
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional, Tuple
+from typing import Awaitable, Callable, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
@@ -160,12 +160,37 @@ def build_oauth_provider(
     storage: "TokenStorage",
     callback_port: int = 8765,
     client_name: str = "TradingAgents",
+    *,
+    redirect_uri: Optional[str] = None,
+    redirect_handler: Optional[Callable[[str], Awaitable[None]]] = None,
+    callback_handler: Optional[Callable[[], Awaitable[Tuple[str, Optional[str]]]]] = None,
 ):
     """Construct an :class:`OAuthClientProvider` for the Robinhood MCP.
 
-    Raises ``RuntimeError`` if the ``mcp`` SDK is unavailable. The returned
-    provider opens the consent page in the default browser and captures the
-    redirect on ``http://localhost:<callback_port>/callback``.
+    Raises ``RuntimeError`` if the ``mcp`` SDK is unavailable.
+
+    By default (no keyword overrides) this preserves the original desktop
+    behaviour exactly: the redirect URI is the loopback
+    ``http://localhost:<callback_port>/callback``, the consent page is opened in
+    the local browser, and the ``code``/``state`` are captured by a one-shot
+    loopback HTTP server.
+
+    For a mobile/server-mediated flow (see ``web/mobile/oauth_flow.py``) the
+    caller can inject:
+
+    * ``redirect_uri`` — a remote HTTPS callback owned by our server
+      (e.g. ``https://<our-domain>/api/v2/robinhood/callback``) instead of
+      loopback. The value is submitted verbatim during Dynamic Client
+      Registration and is what Robinhood redirects back to.
+    * ``redirect_handler`` — an async callable that receives the authorization
+      URL. Instead of opening a server-side browser, a mobile flow captures the
+      URL and hands it to the phone's ``ASWebAuthenticationSession``.
+    * ``callback_handler`` — an async callable returning ``(code, state)``. A
+      mobile flow blocks here until the server's ``/callback`` endpoint receives
+      Robinhood's redirect.
+
+    These overrides are additive; existing desktop callers that pass none get
+    the unchanged loopback flow.
     """
     if not MCP_AVAILABLE:
         raise RuntimeError(
@@ -173,24 +198,29 @@ def build_oauth_provider(
             "Install it with: pip install langchain-mcp-adapters"
         )
 
-    redirect_uri = f"http://localhost:{callback_port}/callback"
+    if redirect_uri is None:
+        redirect_uri = f"http://localhost:{callback_port}/callback"
 
-    async def redirect_handler(authorization_url: str) -> None:
-        logger.info("Opening browser for Robinhood authorization: %s", authorization_url)
-        try:
-            webbrowser.open(authorization_url)
-        except Exception:  # noqa: BLE001 — headless env; user opens it manually
-            pass
-        print(
-            "\n[Robinhood] Authorize TradingAgents in your browser:\n  "
-            f"{authorization_url}\n"
-        )
+    if redirect_handler is None:
 
-    async def callback_handler() -> Tuple[str, Optional[str]]:
-        import asyncio
+        async def redirect_handler(authorization_url: str) -> None:  # type: ignore[misc]
+            logger.info("Opening browser for Robinhood authorization: %s", authorization_url)
+            try:
+                webbrowser.open(authorization_url)
+            except Exception:  # noqa: BLE001 — headless env; user opens it manually
+                pass
+            print(
+                "\n[Robinhood] Authorize TradingAgents in your browser:\n  "
+                f"{authorization_url}\n"
+            )
 
-        # The loopback server is blocking; run it off the event loop.
-        return await asyncio.to_thread(_capture_callback, callback_port)
+    if callback_handler is None:
+
+        async def callback_handler() -> Tuple[str, Optional[str]]:  # type: ignore[misc]
+            import asyncio
+
+            # The loopback server is blocking; run it off the event loop.
+            return await asyncio.to_thread(_capture_callback, callback_port)
 
     metadata = OAuthClientMetadata(
         client_name=client_name,

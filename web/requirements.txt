@@ -7,3 +7,11 @@ supabase>=2.4
 # Robinhood Trading MCP integration (opt-in; only used when
 # TRADINGAGENTS_ROBINHOOD_ENABLED=true). Pulls in the official `mcp` SDK.
 langchain-mcp-adapters>=0.3.0
+# Optional: only needed for the mobile API's Supabase auth mode
+# (MOBILE_API_ENABLED=true AND MOBILE_AUTH_MODE=supabase) to verify Supabase
+# JWTs. The default "dev" auth mode uses a built-in HMAC token layer and does
+# not require this. Import is guarded, so absence never breaks startup.
+# The [crypto] extra pulls in `cryptography`, required for RS256/ES256
+# (asymmetric / JWKS) verification of newer Supabase projects' tokens; HS256
+# alone does not need it, but the extra keeps both paths working.
+pyjwt[crypto]>=2.8
