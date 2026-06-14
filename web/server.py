@@ -69,6 +69,14 @@ ADMIN_PASSWORD = os.environ.get("STOCKAGENTS_ADMIN_PASSWORD")
 # How recent a stored run must be to be served from cache.
 CACHE_WINDOW_MINUTES = 60
 
+# ── Per-user run quota ─────────────────────────────────────────────────────────
+# A per-user cap on how many analyses can be triggered in a rolling window.
+# Each run burns ~$30 of LLM tokens, so without a cap a few users can rack up
+# real spend overnight. Tunable via env so the operator can loosen/tighten the
+# limit without a redeploy. Owner (admin-password unlocked) is always exempt.
+RUN_LIMIT_PER_USER = int(os.environ.get("STOCKAGENTS_RUN_LIMIT_PER_USER", "1"))
+RUN_LIMIT_WINDOW_HOURS = int(os.environ.get("STOCKAGENTS_RUN_LIMIT_WINDOW_HOURS", "24"))
+
 # Wire value -> display name for the four analysts.
 ANALYST_DISPLAY = {
     "market": "Market Analyst",
@@ -1138,8 +1146,67 @@ async def track_event(payload: Dict[str, Any], request: Request) -> dict:
     return {"ok": True}
 
 
+def _is_owner(password: Optional[str]) -> bool:
+    """Whether this request was made by the operator (admin-password unlocked).
+
+    Used to exempt the operator from the per-user run quota. Returns False
+    (treat as anonymous user) when no admin password is configured at all, so
+    a misconfiguration can't accidentally grant everyone unlimited runs.
+    """
+    if not ADMIN_PASSWORD:
+        return False
+    return bool(password) and hmac.compare_digest(password, ADMIN_PASSWORD)
+
+
+def _quota_state(client_meta: Dict[str, Any], owner: bool) -> Dict[str, Any]:
+    """Compute the requester's current quota usage and remaining allowance."""
+    if owner or RUN_LIMIT_PER_USER <= 0:
+        return {
+            "limit": RUN_LIMIT_PER_USER,
+            "used": 0,
+            "remaining": None,  # null = unlimited
+            "window_hours": RUN_LIMIT_WINDOW_HOURS,
+            "owner": owner,
+            "allowed": True,
+        }
+    used = db.count_quota_consumed(
+        client_meta.get("visitor_id"),
+        client_meta.get("ip_address"),
+        hours=RUN_LIMIT_WINDOW_HOURS,
+    )
+    return {
+        "limit": RUN_LIMIT_PER_USER,
+        "used": used,
+        "remaining": max(RUN_LIMIT_PER_USER - used, 0),
+        "window_hours": RUN_LIMIT_WINDOW_HOURS,
+        "owner": False,
+        "allowed": used < RUN_LIMIT_PER_USER,
+    }
+
+
+@app.get("/api/runs/quota")
+async def get_quota(
+    request: Request,
+    x_admin_password: Optional[str] = Header(default=None),
+) -> dict:
+    """How many runs this user has left in the rolling window.
+
+    Lets the UI show "1 free run today / used" *before* the user clicks, instead
+    of only learning at submission time. Mirrors the gate in :func:`start_run`.
+    """
+    loop = asyncio.get_running_loop()
+    meta = _client_meta(request)
+    owner = _is_owner(x_admin_password)
+    state = await loop.run_in_executor(None, _quota_state, meta, owner)
+    return state
+
+
 @app.post("/api/runs")
-async def start_run(req: RunRequest, request: Request) -> dict:
+async def start_run(
+    req: RunRequest,
+    request: Request,
+    x_admin_password: Optional[str] = Header(default=None),
+) -> dict:
     if not req.ticker.strip():
         raise HTTPException(status_code=400, detail="ticker is required")
     if not req.analysts:
@@ -1178,6 +1245,7 @@ async def start_run(req: RunRequest, request: Request) -> dict:
     )
 
     # 60-minute cache: if enabled and a recent run exists, serve it instantly.
+    # Cache hits don't consume the per-user quota — they don't burn LLM tokens.
     if not req.force:
         enabled = await loop.run_in_executor(None, db.get_cache_enabled)
         if enabled:
@@ -1187,10 +1255,53 @@ async def start_run(req: RunRequest, request: Request) -> dict:
             if recent:
                 return {"cached": True, "run": recent}
 
+    # ── Per-user quota gate ───────────────────────────────────────────────
+    # Owner (admin-password unlocked) is exempt. Everyone else is capped at
+    # RUN_LIMIT_PER_USER in a rolling RUN_LIMIT_WINDOW_HOURS window. Failed
+    # runs are refunded (db.count_quota_consumed subtracts run_failed).
+    owner = _is_owner(x_admin_password)
+    quota = await loop.run_in_executor(None, _quota_state, client_meta, owner)
+    if not quota["allowed"]:
+        # 429 with a structured detail the UI can render verbatim.
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "run_limit_reached",
+                "message": (
+                    f"You've used your {quota['limit']} analysis"
+                    f"{'s' if quota['limit'] != 1 else ''} for the day. "
+                    "Each full agent run costs ~$30 in LLM tokens, so to keep "
+                    "this app free we cap at "
+                    f"{quota['limit']} per {quota['window_hours']}h per user."
+                ),
+                "limit": quota["limit"],
+                "used": quota["used"],
+                "window_hours": quota["window_hours"],
+            },
+        )
+
     nodes = _planned_nodes(req.analysts)
     run = manager.create(loop, nodes)
     run.analytics = client_meta  # carried into run_completed/run_failed events
     manager.emit(run, {"type": "nodes", "nodes": nodes})
+
+    # Mark quota consumption. Counted against the user immediately so two
+    # near-simultaneous submissions don't both slip through the gate. Refunded
+    # automatically by run_failed if the run errors out (see _run_pipeline).
+    await loop.run_in_executor(
+        None,
+        db.store_event,
+        {
+            **client_meta,
+            "event_type": "run_started",
+            "props": {
+                "run_id": run.run_id,
+                "ticker": req.ticker.strip().upper(),
+                "asset_type": req.asset_type,
+                "owner": owner,
+            },
+        },
+    )
 
     thread = threading.Thread(target=_run_pipeline, args=(run, req), daemon=True)
     thread.start()

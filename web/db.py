@@ -200,6 +200,55 @@ def store_event(meta: Dict[str, Any]) -> bool:
         return False
 
 
+def count_quota_consumed(
+    visitor_id: Optional[str],
+    ip_address: Optional[str],
+    hours: int = 24,
+) -> int:
+    """Number of runs that count against this user's daily quota in the window.
+
+    Counts ``run_started`` events MINUS ``run_failed`` events in the last
+    ``hours``, matching either ``visitor_id`` or ``ip_address`` (so clearing
+    storage / using incognito doesn't grant a fresh allowance to the same IP).
+    Failed runs are refunded — only successful or in-flight runs consume quota.
+
+    Fail-open: returns 0 when Supabase is unavailable or the query errors, so a
+    transient DB issue can't lock everyone out.
+    """
+    client = _get_client()
+    if client is None:
+        return 0
+    if not visitor_id and not ip_address:
+        return 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    try:
+        def _count(event_type: str) -> int:
+            q = (
+                client.table("events")
+                .select("id", count="exact")
+                .eq("event_type", event_type)
+                .gte("created_at", cutoff)
+            )
+            # PostgREST OR: match either visitor or IP. Both fields are stored
+            # by store_event(), so a single condition tree covers both.
+            ors: List[str] = []
+            if visitor_id:
+                ors.append(f"visitor_id.eq.{visitor_id}")
+            if ip_address:
+                ors.append(f"ip_address.eq.{ip_address}")
+            if ors:
+                q = q.or_(",".join(ors))
+            res = q.execute()
+            return int(getattr(res, "count", None) or 0)
+
+        started = _count("run_started")
+        failed = _count("run_failed")
+        return max(started - failed, 0)
+    except Exception as exc:  # noqa: BLE001 — never lock users out on DB error
+        logger.warning("count_quota_consumed failed: %s", exc)
+        return 0
+
+
 def get_recent_run(
     ticker: str, trade_date: str, within_minutes: int = 60
 ) -> Optional[Dict[str, Any]]:

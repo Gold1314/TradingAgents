@@ -89,6 +89,15 @@
     </div>
   </header>
 
+  <!-- ░░ Daily-quota banner ░░ -->
+  <div id="quota-banner" class="hidden mb-4 rounded-xl border px-4 py-3 text-xs sm:text-sm flex items-start gap-3" role="status" aria-live="polite">
+    <span id="quota-icon" class="text-base leading-none mt-0.5">ℹ️</span>
+    <div class="flex-1">
+      <div id="quota-title" class="font-semibold"></div>
+      <div id="quota-msg" class="text-slate-400 mt-0.5"></div>
+    </div>
+  </div>
+
   <!-- ░░ Input form ░░ -->
   <form id="run-form" class="bg-slate-900/70 backdrop-blur border border-slate-800 rounded-2xl p-5 mb-6 shadow-xl shadow-black/20">
     <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -961,12 +970,14 @@ function handleEvent(ev){
     case "final": showVerdict(ev.decision,ev.content); break;
     case "account": showAccount(ev); break;
     case "trade": showTrade(ev); refreshRobinhoodStatus(); break;
-    case "error": statusPill("error","#f43f5e"); showError(ev.message); break;
+    case "error": statusPill("error","#f43f5e"); showError(ev.message); refreshQuota(); break;
     case "done":
       plannedNodes.forEach((n)=>setNodeState(n,"done"));
       clearActiveRun();
       $("run-btn").dataset.finished="1";
-      statusPill("complete","#34d399"); stopTimer(); $("run-btn").disabled=false; $("new-run").disabled=false; $("download-pdf").classList.remove("hidden"); if(activeES) activeES.close(); break;
+      statusPill("complete","#34d399"); stopTimer(); $("run-btn").disabled=false; $("new-run").disabled=false; $("download-pdf").classList.remove("hidden"); if(activeES) activeES.close();
+      refreshQuota(); // server bookkeeping: success consumed the quota; failure refunds it
+      break;
   }
 }
 function showError(msg){
@@ -1037,8 +1048,17 @@ async function startRun(force){
   $("run-form").classList.add("hidden"); $("run-summary").classList.remove("hidden");
 
   let res;
-  try{ res=await fetch("/api/runs",{method:"POST",headers:{"Content-Type":"application/json",...Analytics.headers()},body:JSON.stringify(body)}); }
+  try{ res=await fetch("/api/runs",{method:"POST",headers:{"Content-Type":"application/json",...Analytics.headers(),...(adminPw?{"X-Admin-Password":adminPw}:{})},body:JSON.stringify(body)}); }
   catch{ showError("Could not reach the server. Is it running?"); $("run-btn").disabled=false; $("new-run").disabled=false; statusPill("error","#f43f5e"); return; }
+  if(res.status===429){
+    const err=await res.json().catch(()=>({}));
+    const d=err.detail||{};
+    renderQuota({allowed:false,owner:false,limit:d.limit||1,used:d.used||1,remaining:0,window_hours:d.window_hours||24});
+    showError(d.message||"Daily run limit reached. Try again tomorrow.");
+    $("run-btn").disabled=true; $("new-run").disabled=false; statusPill("daily limit","#f43f5e");
+    $("run-summary").classList.add("hidden"); $("run-form").classList.remove("hidden");
+    return;
+  }
   if(!res.ok){ const err=await res.json().catch(()=>({})); showError((err.detail&&JSON.stringify(err.detail))||`Request failed (${res.status})`); $("run-btn").disabled=false; $("new-run").disabled=false; statusPill("error","#f43f5e"); return; }
   const data=await res.json();
 
@@ -1049,6 +1069,7 @@ async function startRun(force){
   updateBlueprintLinks();
   startTimer();
   connectEventSource(data.run_id);
+  refreshQuota(); // consumption is now visible to the server; sync the banner
 }
 
 $("run-form").addEventListener("submit",(e)=>{ e.preventDefault(); startRun(false); });
@@ -1227,7 +1248,10 @@ async function downloadPDF(){
 $("download-pdf").onclick=downloadPDF;
 
 // ── admin panel ─────────────────────────────────────────────────────────────
-let adminPw="";
+// Persisted across reloads so the owner stays exempt from the daily run quota
+// without re-unlocking every visit. Stored in localStorage on a deliberate
+// unlock action — no auto-prompt is shown to other users.
+let adminPw=localStorage.getItem("sa_admin_pw")||"";
 function setSwitch(on){
   const sw=$("cache-switch"), knob=sw.firstElementChild;
   sw.dataset.on=on?"1":"0";
@@ -1249,9 +1273,11 @@ $("admin-unlock").onclick=async()=>{
   if(!res.ok){ $("admin-msg").textContent="Could not load settings."; return; }
   const s=await res.json();
   adminPw=pw;
+  try{ localStorage.setItem("sa_admin_pw", pw); }catch{}
   $("admin-locked").classList.add("hidden"); $("admin-panel").classList.remove("hidden");
   setSwitch(!!s.cache_enabled);
   $("admin-panel-msg").textContent=s.supabase_configured?`Window: ${s.cache_window_minutes} minutes.`:"Supabase not configured — toggle has no effect yet.";
+  refreshQuota(); // owner is now exempt — re-render banner
 };
 $("cache-switch").onclick=async()=>{
   const next=$("cache-switch").dataset.on!=="1";
@@ -1260,7 +1286,45 @@ $("cache-switch").onclick=async()=>{
   else { const e=await res.json().catch(()=>({})); $("admin-panel-msg").textContent=e.detail||"Update failed."; }
 };
 
+// ── daily run quota banner ─────────────────────────────────────────────────
+// Authoritative count is server-side (Supabase events table); this is just the
+// UI hint so users know their state before clicking Run analysis.
+async function refreshQuota(){
+  try{
+    const r=await fetch("/api/runs/quota",{headers:{...Analytics.headers(),...(adminPw?{"X-Admin-Password":adminPw}:{})}});
+    if(!r.ok) return;
+    renderQuota(await r.json());
+  }catch{}
+}
+function renderQuota(q){
+  const el=$("quota-banner"); if(!el) return;
+  el.classList.remove("hidden");
+  el.classList.remove("border-emerald-500/40","bg-emerald-500/5","text-emerald-200","border-amber-500/40","bg-amber-500/5","text-amber-200","border-rose-500/40","bg-rose-500/5","text-rose-200","border-sky-500/40","bg-sky-500/5","text-sky-200");
+  if(q.owner){
+    el.classList.add("border-sky-500/40","bg-sky-500/5","text-sky-200");
+    $("quota-icon").textContent="👑";
+    $("quota-title").textContent="Owner mode — unlimited runs";
+    $("quota-msg").textContent="The daily run cap doesn't apply to you (admin password unlocked).";
+    $("run-btn").disabled=false;
+    return;
+  }
+  if(q.allowed){
+    el.classList.add("border-emerald-500/40","bg-emerald-500/5","text-emerald-200");
+    $("quota-icon").textContent="✨";
+    $("quota-title").textContent=`${q.remaining} of ${q.limit} free analysis ${q.remaining===1?"run":"runs"} left today`;
+    $("quota-msg").innerHTML=`Each full agent run costs roughly <strong>$30 in LLM tokens</strong>, so to keep this app free we cap at <strong>${q.limit} per ${q.window_hours}h per visitor</strong>. Cached results don't count.`;
+    $("run-btn").disabled=false;
+  }else{
+    el.classList.add("border-rose-500/40","bg-rose-500/5","text-rose-200");
+    $("quota-icon").textContent="🚫";
+    $("quota-title").textContent="You've used your free analysis for the day";
+    $("quota-msg").innerHTML=`Each full agent run costs roughly <strong>$30 in LLM tokens</strong> — leaving the app uncapped burned <strong>~$150 in 5 days</strong>. So this is limited to <strong>${q.limit} per ${q.window_hours}h per visitor</strong>. Try again tomorrow, or browse the cached run for this ticker.`;
+    $("run-btn").disabled=true;
+  }
+}
+
 loadConfig();
+refreshQuota();
 </script>
 </body>
 </html>
