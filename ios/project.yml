@@ -1,0 +1,102 @@
+# XcodeGen project spec for StockAgents (iOS).
+#
+# Why XcodeGen: a hand-maintained `.pbxproj` is fragile and merge-hostile. This
+# single declarative file regenerates a clean `.xcodeproj` from the source tree
+# on demand (`xcodegen generate`), so the repo stays diff-friendly and the
+# project structure is reviewable in plain text.
+#
+# Usage:
+#   brew install xcodegen
+#   cd ios && xcodegen generate && open StockAgents.xcodeproj
+
+name: StockAgents
+options:
+  bundleIdPrefix: com.stockagents
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: "" # fill in your Apple Developer team id for device builds
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    GENERATE_INFOPLIST_FILE: NO
+
+targets:
+  StockAgents:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: StockAgents
+    info:
+      path: StockAgents/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: StockAgents
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # MVP base URL default. Override at runtime in Settings, or per build via
+        # the STOCKAGENTS_BASE_URL Info.plist key below.
+        STOCKAGENTS_BASE_URL: "http://localhost:8000"
+        # Supabase Auth (GoTrue) sign-in config (plan §3.4.1). NOT secrets baked
+        # into source — left blank here on purpose. Set your project URL and the
+        # *publishable anon key* (Project → Settings → API) per build via an
+        # xcconfig (e.g. SUPABASE_URL = $(SUPABASE_URL)) or by editing these
+        # values locally; they can also be overridden at runtime in UserDefaults
+        # (see SupabaseConfig). The anon key is publishable/safe for clients; the
+        # service-role key (backend SUPABASE_KEY) is NEVER used by the app.
+        # When blank the app shows the "sign-in isn't configured" login state.
+        SUPABASE_URL: ""
+        SUPABASE_ANON_KEY: ""
+        # Required for the LocalAuthentication (Face ID) gate on LIVE orders
+        # (plan §5.3). Touch ID devices reuse this string via the system prompt.
+        NSFaceIDUsageDescription: "StockAgents uses Face ID to confirm and authorize live brokerage orders before they are placed."
+        # Custom URL scheme for the server-mediated Robinhood OAuth bounce-back
+        # (stockagents://oauth/robinhood?status=...). ASWebAuthenticationSession
+        # matches this scheme to hand the callback URL back to the app (§5.1.3).
+        CFBundleURLTypes:
+          - CFBundleURLName: com.stockagents.app.oauth
+            CFBundleURLSchemes:
+              - stockagents
+        # ATS: production must be HTTPS. This scoped exception only allows the
+        # local dev server over plain HTTP. Remove/replace for release builds.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stockagents.app
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+
+  StockAgentsTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: StockAgentsTests
+    dependencies:
+      - target: StockAgents
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stockagents.app.tests
+
+schemes:
+  StockAgents:
+    build:
+      targets:
+        StockAgents: all
+        StockAgentsTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - StockAgentsTests

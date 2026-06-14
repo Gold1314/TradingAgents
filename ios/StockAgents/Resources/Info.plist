@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Most Info.plist keys are injected by XcodeGen from project.yml (see the
+  `info.properties` block there). This file is the on-disk plist XcodeGen
+  writes into; it is kept minimal and the source of truth for the build is
+  project.yml. STOCKAGENTS_BASE_URL is the build-time default backend URL and
+  can be overridden at runtime from the in-app Settings screen.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>StockAgents</string>
+	<key>STOCKAGENTS_BASE_URL</key>
+	<string>http://localhost:8000</string>
+	<key>SUPABASE_URL</key>
+	<string></string>
+	<key>SUPABASE_ANON_KEY</key>
+	<string></string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>StockAgents uses Face ID to confirm and authorize live brokerage orders before they are placed.</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.stockagents.app.oauth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>stockagents</string>
+			</array>
+		</dict>
+	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>UILaunchScreen</key>
+	<dict/>
+</dict>
+</plist>
