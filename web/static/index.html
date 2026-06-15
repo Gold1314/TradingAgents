@@ -9,6 +9,10 @@
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <!-- Voice-conversational layer. The client lazy-loads livekit-client only
+       on the first Talk click and is a no-op when /api/voice/config reports
+       the feature is off, so this script tag is safe to ship unconditionally. -->
+  <script src="/static/voice/voice-client.js" defer></script>
   <script>tailwind.config = { darkMode: "class" };</script>
   <style>
     :root { color-scheme: dark; }
@@ -780,13 +784,26 @@ function feedCard(node){
         <div class="flex items-center gap-2"><span class="font-semibold text-slate-100">${node}</span><span class="text-[10px] text-slate-500">${m.blurb}</span></div>
         <div class="text-xs text-slate-500 truncate" data-preview>—</div>
       </div>
+      <button data-talk type="button" title="Talk to this agent"
+        class="hidden text-[11px] font-semibold px-2.5 py-1 rounded-full
+               border border-emerald-500/50 bg-emerald-500/10 text-emerald-200
+               hover:bg-emerald-500/25 hover:border-emerald-400 transition shrink-0
+               flex items-center gap-1">
+        <span style="font-size:13px;line-height:1">🎙</span>Talk
+      </button>
       <span class="text-xs flex items-center gap-1.5 shrink-0" data-badge style="color:#fbbf24"><span class="w-1.5 h-1.5 rounded-full bg-amber-400 pulse-dot"></span>working</span>
       <span class="text-slate-600 text-xs" data-chev>▸</span>
     </div>
     <div class="px-4 pb-4 pt-1 feed-md text-sm text-slate-300 hidden scroll-body" data-body></div>`;
-  card.querySelector("[data-toggle]").onclick=()=>{
+  card.querySelector("[data-toggle]").onclick=(e)=>{
+    // Don't toggle the body when the Talk button itself is clicked.
+    if(e.target.closest("[data-talk]")) return;
     const b=card.querySelector("[data-body]"), c=card.querySelector("[data-chev]");
     const hidden=b.classList.toggle("hidden"); c.textContent=hidden?"▸":"▾";
+  };
+  card.querySelector("[data-talk]").onclick=(e)=>{
+    e.stopPropagation();
+    startVoiceCall(node, card);
   };
   sec.querySelector("[data-cards]").appendChild(card); cardEls[node]=card;
   card.scrollIntoView({behavior:"smooth",block:"nearest"});
@@ -795,6 +812,7 @@ function feedCard(node){
 function updateCard(node,{status,content}){
   const card=feedCard(node);
   const badge=card.querySelector("[data-badge]"), body=card.querySelector("[data-body]"), prev=card.querySelector("[data-preview]");
+  const talkBtn=card.querySelector("[data-talk]");
   if(status==="running"){ badge.innerHTML=`<span class="w-1.5 h-1.5 rounded-full bg-amber-400 pulse-dot"></span>working`; badge.style.color="#fbbf24"; return; }
   if(status==="done"){
     badge.innerHTML=`✓ done`; badge.style.color="#34d399";
@@ -805,6 +823,42 @@ function updateCard(node,{status,content}){
       card.querySelector("[data-body]").before(chart);
       loadChart(chart, currentParams);
     }
+    // Reveal the "Talk to this agent" button once the agent's report is on
+    // screen — voice is only allowed against a finished agent.
+    maybeShowTalk(talkBtn);
+  }
+}
+
+// ── Voice-conversational glue ─────────────────────────────────────────────
+// Cached "is voice ready?" probe (one fetch per page load). When the backend
+// reports the feature off, the Talk buttons stay hidden — costs zero.
+let _voiceReadyPromise = null;
+function voiceReady(){
+  if(_voiceReadyPromise) return _voiceReadyPromise;
+  _voiceReadyPromise = (window.VoiceClient && window.VoiceClient.isReady)
+    ? window.VoiceClient.isReady().catch(()=>false)
+    : Promise.resolve(false);
+  return _voiceReadyPromise;
+}
+async function maybeShowTalk(btn){
+  if(!btn) return;
+  const ready = await voiceReady();
+  if(ready) btn.classList.remove("hidden");
+}
+async function startVoiceCall(node, card){
+  const btn = card.querySelector("[data-talk]");
+  if(!activeRunId){
+    if(btn){ btn.title = "No active run"; }
+    return;
+  }
+  if(!window.VoiceClient){ return; }
+  if(btn){ btn.disabled = true; btn.classList.add("opacity-50"); }
+  try {
+    await window.VoiceClient.start({ runId: activeRunId, agentId: node });
+  } catch(err){
+    statusPill(err.message || "voice failed", "#f43f5e");
+  } finally {
+    if(btn){ btn.disabled = false; btn.classList.remove("opacity-50"); }
   }
 }
 
@@ -1312,13 +1366,13 @@ function renderQuota(q){
     el.classList.add("border-emerald-500/40","bg-emerald-500/5","text-emerald-200");
     $("quota-icon").textContent="✨";
     $("quota-title").textContent=`${q.remaining} of ${q.limit} free analysis ${q.remaining===1?"run":"runs"} left today`;
-    $("quota-msg").innerHTML=`Each full agent run costs roughly <strong>$30 in LLM tokens</strong>, so to keep this app free we cap at <strong>${q.limit} per ${q.window_hours}h per visitor</strong>. Cached results don't count.`;
+    $("quota-msg").innerHTML=`Each full agent run uses many LLM calls and costs roughly <strong>$3–$5 in tokens</strong> (more on Opus models), so to keep this app free we cap at <strong>${q.limit} per ${q.window_hours}h per visitor</strong>. Cached results don't count.`;
     $("run-btn").disabled=false;
   }else{
     el.classList.add("border-rose-500/40","bg-rose-500/5","text-rose-200");
     $("quota-icon").textContent="🚫";
     $("quota-title").textContent="You've used your free analysis for the day";
-    $("quota-msg").innerHTML=`Each full agent run costs roughly <strong>$30 in LLM tokens</strong> — leaving the app uncapped burned <strong>~$150 in 5 days</strong>. So this is limited to <strong>${q.limit} per ${q.window_hours}h per visitor</strong>. Try again tomorrow, or browse the cached run for this ticker.`;
+    $("quota-msg").innerHTML=`Each full agent run costs roughly <strong>$3–$5 in LLM tokens</strong> (more on Opus models), and uncapped traffic added up to <strong>~$150 in 5 days</strong>. So this is limited to <strong>${q.limit} per ${q.window_hours}h per visitor</strong>. Try again tomorrow, or browse the cached run for this ticker.`;
     $("run-btn").disabled=true;
   }
 }

@@ -1270,9 +1270,9 @@ async def start_run(
                 "message": (
                     f"You've used your {quota['limit']} analysis"
                     f"{'s' if quota['limit'] != 1 else ''} for the day. "
-                    "Each full agent run costs ~$30 in LLM tokens, so to keep "
-                    "this app free we cap at "
-                    f"{quota['limit']} per {quota['window_hours']}h per user."
+                    "Each full agent run costs roughly $3–$5 in LLM tokens "
+                    "(more on Opus models), so to keep this app free we cap "
+                    f"at {quota['limit']} per {quota['window_hours']}h per user."
                 ),
                 "limit": quota["limit"],
                 "used": quota["used"],
@@ -1430,3 +1430,19 @@ try:
     include_mobile_api(app)
 except ImportError as exc:  # noqa: BLE001 — mobile API is optional
     logger.warning("Mobile API unavailable, skipping (/api/v2 disabled): %s", exc)
+
+
+# ── Voice-conversational API — additive, default OFF (see web/voice/) ─────────
+# Mounts /api/voice/* only when TRADINGAGENTS_VOICE_ENABLED=true AND all three
+# transport credentials (LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET)
+# are set. With the feature off the web app is unchanged (no router, no
+# imports beyond the gate). Missing optional voice deps (livekit-agents and
+# plugins) are tolerated here because the FastAPI process only mints session
+# tokens — the worker is a separate `python -m tradingagents.voice.agent_worker`
+# process that owns the heavy dependencies.
+try:
+    from web.voice import include_voice_api  # noqa: E402
+
+    include_voice_api(app)
+except ImportError as exc:  # noqa: BLE001 — voice API is optional
+    logger.warning("Voice API unavailable, skipping (/api/voice disabled): %s", exc)
