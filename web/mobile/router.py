@@ -87,6 +87,27 @@ def build_mobile_router(server: ModuleType) -> APIRouter:
         if not body.analysts:
             raise HTTPException(status_code=400, detail="select at least one analyst")
 
+        loop = asyncio.get_running_loop()
+
+        # 60-minute cache lookup — mirrors the web endpoint in server.py. When
+        # the global cache toggle is on and a recent run exists for the same
+        # (ticker, trade_date), serve it instantly instead of burning another
+        # full pipeline. Cache hits intentionally bypass the per-user quota:
+        # they cost zero LLM tokens. ``body.force`` is the "Run fresh anyway"
+        # opt-out, mirroring the web client.
+        if not body.force:
+            enabled = await loop.run_in_executor(None, server.db.get_cache_enabled)
+            if enabled:
+                recent = await loop.run_in_executor(
+                    None,
+                    server.db.get_recent_run,
+                    body.ticker,
+                    body.trade_date,
+                    server.CACHE_WINDOW_MINUTES,
+                )
+                if recent:
+                    return {"cached": True, "run": recent}
+
         retry_after = limiter.check_and_consume(user.user_id)
         if retry_after is not None:
             raise HTTPException(
@@ -96,7 +117,6 @@ def build_mobile_router(server: ModuleType) -> APIRouter:
             )
 
         req = server.RunRequest(**body.model_dump())
-        loop = asyncio.get_running_loop()
         nodes = server._planned_nodes(req.analysts)
         run = server.manager.create(loop, nodes)
         # Record the owner (for per-user order authorization) and the ticker (so

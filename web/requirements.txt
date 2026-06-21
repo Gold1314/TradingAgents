@@ -14,4 +14,28 @@ langchain-mcp-adapters>=0.3.0
 # The [crypto] extra pulls in `cryptography`, required for RS256/ES256
 # (asymmetric / JWKS) verification of newer Supabase projects' tokens; HS256
 # alone does not need it, but the extra keeps both paths working.
+# PyJWT is also used by web/voice/jwt.py to mint LiveKit access tokens
+# (HS256 with the LiveKit API secret) when the voice feature is enabled.
 pyjwt[crypto]>=2.8
+# ── Voice-conversational layer (opt-in; gated by TRADINGAGENTS_VOICE_ENABLED) ──
+# These two packages are only needed by the worker process
+# (`python -m tradingagents.voice.agent_worker`) and the router's runtime —
+# the FastAPI server imports the worker lazily so a missing install only
+# fails when voice is actually turned on. The plugin extras pull the
+# matching ASR/TTS/LLM SDKs in one declaration so operators don't have to
+# pick them piecemeal.
+livekit-agents[deepgram,elevenlabs,silero]>=0.11; python_version >= "3.10"
+# Voice conversational LLM = Anthropic Claude (low-latency Haiku by default,
+# overrideable via TRADINGAGENTS_VOICE_LLM_MODEL). Lives in its own plugin
+# package because livekit-agents' extras don't ship an [anthropic] tag.
+livekit-plugins-anthropic>=1.6; python_version >= "3.10"
+# Server SDK used by the FastAPI router to pre-create LiveKit rooms with
+# explicit agent dispatch (RoomAgentDispatch) and room metadata. Without
+# this, rooms get auto-created on first publisher join but without the
+# agent dispatch config, so the worker never gets invoked for the room.
+livekit-api>=1.0.0; python_version >= "3.10"
+# Cartesia is supported as a hot-swappable TTS alternative
+# (TRADINGAGENTS_VOICE_TTS_PROVIDER=cartesia). Optional — only installed for
+# operators who pick the alternative provider. Kept as a separate extra so
+# the default install isn't paying for the dep.
+# livekit-plugins-cartesia>=0.1

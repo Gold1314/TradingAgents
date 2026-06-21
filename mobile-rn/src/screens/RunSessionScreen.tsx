@@ -10,6 +10,7 @@ import { Economics } from '../components/Economics';
 import { AgentFeed } from '../components/AgentFeed';
 import { Banner } from '../components/primitives';
 import { isActionable } from '../models/order';
+import { apiClient } from '../services/apiClient';
 import { colors, radius, spacing, withAlpha } from '../theme/theme';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'RunSession'>;
@@ -37,9 +38,15 @@ export function RunSessionScreen({ route, navigation }: Props) {
     }
   }
 
-  // Derive chart inputs + stream config from the mode.
+  // Derive chart inputs + stream config from the mode. SSE streaming is only
+  // started for live (`started`/`restore`) modes — a cached run is already
+  // complete by definition. The `runId`, on the other hand, is needed by
+  // every mode that has one so the voice layer (Talk button → voice
+  // session) can attach to the persisted run. For cached hits, the id
+  // comes from the Supabase row carried by the navigation params.
   const live = params.mode !== 'cached';
-  const runId = params.mode === 'cached' ? null : params.runId;
+  const runId =
+    params.mode === 'cached' ? params.run.runId : params.runId;
   const chartArgs =
     params.mode === 'cached'
       ? { ticker: params.run.ticker, tradeDate: params.run.tradeDate, assetType: params.run.assetType ?? 'stock' }
@@ -62,6 +69,19 @@ export function RunSessionScreen({ route, navigation }: Props) {
       ),
     });
   }, [navigation, chartArgs.ticker, chartArgs.tradeDate]);
+
+  // Capability probe for the Talk button. Failures collapse to `false` so the
+  // rest of the run UI is unaffected — see `apiClient.fetchVoiceConfig`.
+  const [voiceReady, setVoiceReady] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void apiClient.fetchVoiceConfig().then((cfg) => {
+      if (!cancelled) setVoiceReady(cfg.ready);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const phase = useRunSession((s) => s.phase);
   const statusMessage = useRunSession((s) => s.statusMessage);
@@ -104,7 +124,14 @@ export function RunSessionScreen({ route, navigation }: Props) {
         </Pressable>
       )}
 
-      <AgentFeed />
+      <AgentFeed
+        voiceReady={voiceReady && runId != null}
+        onTalkRequested={
+          runId != null
+            ? (agentId) => navigation.navigate('VoiceCall', { runId, agentId })
+            : undefined
+        }
+      />
     </ScrollView>
   );
 }

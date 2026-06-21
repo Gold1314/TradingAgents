@@ -19,6 +19,8 @@
 	<string></string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>StockAgents uses Face ID to confirm and authorize live brokerage orders before they are placed.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>StockAgents uses your microphone for real-time voice conversations with the AI agents (after a run completes, tap "Talk" on any agent card).</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>

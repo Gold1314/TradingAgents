@@ -105,6 +105,14 @@ def store_run(meta: Dict[str, Any], agents: List[Dict[str, Any]]) -> Optional[st
             "final_content": meta.get("final_content"),
             "identity": meta.get("identity"),
         }
+        # Pin the row id to the caller's run id (the in-memory id the client and
+        # the voice worker key on) when supplied, so the out-of-process voice
+        # worker can locate this run via ``runs.id``. Without it Postgres assigns
+        # a fresh ``gen_random_uuid()`` that nothing downstream knows. Omitted
+        # ids fall back to the DB default (preserves the legacy/CLI behaviour).
+        run_id_hint = meta.get("run_id")
+        if run_id_hint:
+            run_row["id"] = run_id_hint
         res = client.table("runs").insert(run_row).execute()
         run_id = (res.data or [{}])[0].get("id")
         if run_id and agents:

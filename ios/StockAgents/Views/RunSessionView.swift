@@ -9,6 +9,8 @@ struct RunSessionView: View {
     let onNewRun: () -> Void
 
     @State private var showOrderTicket = false
+    @State private var voiceReady = false
+    @State private var voiceAgentID: String?
 
     var body: some View {
         ScrollView {
@@ -42,7 +44,12 @@ struct RunSessionView: View {
 
                 orderTicketEntry
 
-                AgentFeedView(viewModel: viewModel)
+                AgentFeedView(
+                    viewModel: viewModel,
+                    runID: viewModel.runID,
+                    voiceReady: voiceReady,
+                    onTalkRequested: { agent in voiceAgentID = agent }
+                )
             }
             .padding()
         }
@@ -54,6 +61,12 @@ struct RunSessionView: View {
                 Button("New run", action: onNewRun)
             }
         }
+        .task {
+            // One-shot capability probe — feature flag for the Talk button.
+            // Failures degrade silently to "voice unavailable" so the button
+            // simply doesn't appear; the rest of the run UI is unaffected.
+            voiceReady = (try? await env.api.fetchVoiceConfig().ready) ?? false
+        }
         .onDisappear { viewModel.stop() }
         .sheet(isPresented: $showOrderTicket) {
             if let runID = viewModel.runID, let trade = viewModel.lastTrade {
@@ -63,6 +76,37 @@ struct RunSessionView: View {
                 )
             }
         }
+        .sheet(item: voiceSheetBinding) { selection in
+            VoiceCallView(
+                viewModel: VoiceCallViewModel(
+                    runID: viewModel.runID ?? "",
+                    agentID: selection.agentID,
+                    api: env.api
+                ),
+                onHandoffPicked: { nextAgent in
+                    // Close and reopen for the next persona. SwiftUI requires
+                    // a one-cycle gap so the existing sheet fully dismisses
+                    // before the next presentation; ``DispatchQueue.main``
+                    // suffices.
+                    voiceAgentID = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        voiceAgentID = nextAgent
+                    }
+                }
+            )
+        }
+    }
+
+    /// Reshape `voiceAgentID` into a `Binding<Identifiable?>` so SwiftUI's
+    /// `sheet(item:)` API can drive presentation. We use a lightweight
+    /// `Identifiable` wrapper rather than relying on `String: Identifiable`
+    /// (which Swift doesn't provide out of the box) and keep all the state
+    /// in this view so the parent navigator stays unaware of voice.
+    private var voiceSheetBinding: Binding<VoiceAgentSelection?> {
+        Binding(
+            get: { voiceAgentID.map(VoiceAgentSelection.init) },
+            set: { voiceAgentID = $0?.agentID }
+        )
     }
 
     /// Appears once a finished run proposes an actionable buy/sell. Opens the
@@ -172,6 +216,13 @@ struct RunSessionView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(RoundedRectangle(cornerRadius: 10).fill(Theme.danger.opacity(0.12)))
     }
+}
+
+/// Lightweight Identifiable wrapper so `voiceAgentID: String?` can drive
+/// SwiftUI's `sheet(item:)`. Reset to nil from the parent dismisses the sheet.
+private struct VoiceAgentSelection: Identifiable {
+    let agentID: String
+    var id: String { agentID }
 }
 
 /// Tiny elapsed-time chip that ticks once a second while a run streams.

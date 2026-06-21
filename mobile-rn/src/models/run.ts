@@ -99,6 +99,14 @@ export interface CachedAgentOutput {
 
 /** A persisted run served from the 60-minute cache (shape from `db.get_recent_run`). */
 export interface CachedRun {
+  /**
+   * The original Supabase `runs.id` row — same value the voice router accepts
+   * on `POST /api/voice/sessions` via its `voice_db.get_run_owner` fallback
+   * path. Carrying it on cache hits lets the run-session screen keep voice
+   * affordances enabled (Talk button, handoff) without needing to re-create
+   * an in-memory run entry.
+   */
+  runId: string | null;
   ticker: string;
   tradeDate: string;
   assetType: string | null;
@@ -134,6 +142,9 @@ export function parseStartRunResponse(input: unknown): StartRunResponse {
     return {
       cached: true,
       run: {
+        // Supabase serializes the row's primary key as `id`. The cache hit
+        // payload is the raw row dict — see web/db.py:get_recent_run.
+        runId: typeof r.id === 'string' ? r.id : str(r.run_id),
         ticker: typeof r.ticker === 'string' ? r.ticker : '',
         tradeDate: typeof r.trade_date === 'string' ? r.trade_date : '',
         assetType: str(r.asset_type),

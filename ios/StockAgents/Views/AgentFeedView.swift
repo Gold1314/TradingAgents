@@ -6,6 +6,18 @@ import SwiftUI
 struct AgentFeedView: View {
     @ObservedObject var viewModel: RunSessionViewModel
 
+    /// Run id required to mint a voice session. When `nil`, the "Talk"
+    /// button stays hidden (also gated on `voiceReady`).
+    var runID: String?
+
+    /// Whether the server has the voice feature configured. Set by the
+    /// parent screen after probing `/api/voice/config` once.
+    var voiceReady: Bool = false
+
+    /// Parent callback invoked when the user taps "Talk" on an agent card.
+    /// The host (`RunSessionView`) opens a `VoiceCallView` sheet.
+    var onTalkRequested: ((String) -> Void)?
+
     var body: some View {
         VStack(spacing: 12) {
             if let identity = viewModel.identity, !identity.isEmpty {
@@ -16,7 +28,9 @@ struct AgentFeedView: View {
                     card: card,
                     usage: viewModel.usageByNode[card.node],
                     chart: card.node == AgentNode.chartHostNode ? viewModel.chart : nil,
-                    chartError: card.node == AgentNode.chartHostNode ? viewModel.chartError : nil
+                    chartError: card.node == AgentNode.chartHostNode ? viewModel.chartError : nil,
+                    canTalk: voiceReady && runID != nil,
+                    onTalk: { onTalkRequested?(card.node) }
                 )
             }
         }
@@ -45,6 +59,15 @@ struct AgentCardView: View {
     let usage: UsageEvent?
     let chart: ChartPayload?
     let chartError: String?
+
+    /// True when the parent screen has probed `/api/voice/config` and the
+    /// server reports voice is configured. Combined with `card.status == .done`
+    /// to gate the "Talk" button.
+    var canTalk: Bool = false
+
+    /// Tap handler for the "Talk" button. The parent opens a sheet hosting
+    /// `VoiceCallView` for this agent.
+    var onTalk: (() -> Void)?
 
     @State private var isExpanded = false
 
@@ -95,11 +118,40 @@ struct AgentCardView: View {
                     .lineLimit(1)
             }
             Spacer()
+            if canTalk && card.status == .done {
+                talkButton
+            }
             statusBadge
             Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                 .font(.caption)
                 .foregroundStyle(Theme.textMuted)
         }
+    }
+
+    /// "Talk" affordance that opens the voice call sheet. Hidden until the
+    /// agent's report is `done` and the server has voice configured — there's
+    /// nothing to discuss before the analysis is in.
+    private var talkButton: some View {
+        Button {
+            onTalk?()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "waveform.circle.fill")
+                Text("Talk")
+            }
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(
+                Capsule().fill(Theme.accent.opacity(0.18))
+            )
+            .overlay(
+                Capsule().stroke(Theme.accent.opacity(0.6), lineWidth: 1)
+            )
+            .foregroundStyle(Theme.accent)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Talk to \(meta.name)")
     }
 
     private var avatar: some View {

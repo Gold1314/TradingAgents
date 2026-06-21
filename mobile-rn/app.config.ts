@@ -18,6 +18,13 @@ const config: ExpoConfig = {
   ios: {
     supportsTablet: true,
     bundleIdentifier: 'com.stockagents.mobile',
+    infoPlist: {
+      // Required for the voice-conversational layer (Phase 4). Without this
+      // string iOS denies microphone access and the LiveKit room joins as
+      // listen-only, which makes the agent appear unresponsive.
+      NSMicrophoneUsageDescription:
+        'StockAgents uses the microphone so you can talk to the analysis agents in real time.',
+    },
   },
   android: {
     package: 'com.stockagents.mobile',
@@ -25,6 +32,14 @@ const config: ExpoConfig = {
       backgroundColor: '#0f172a',
       foregroundImage: './assets/android-icon-foreground.png',
     },
+    permissions: [
+      // Voice-conversational layer (Phase 4). LiveKit requires explicit mic
+      // + bluetooth perms on Android 12+; we keep the rest of the perms list
+      // empty so Expo's defaults aren't overridden.
+      'android.permission.RECORD_AUDIO',
+      'android.permission.MODIFY_AUDIO_SETTINGS',
+      'android.permission.BLUETOOTH_CONNECT',
+    ],
   },
   web: {
     favicon: './assets/favicon.png',
@@ -33,6 +48,13 @@ const config: ExpoConfig = {
     'expo-secure-store',
     'expo-web-browser',
     ['expo-local-authentication', { faceIDPermission: 'Authorize LIVE trades with Face ID.' }],
+    // LiveKit React Native SDK Expo plugin chain. These config plugins are
+    // applied during `expo prebuild` so the resulting iOS + Android projects
+    // link the LiveKit WebRTC native modules. Without the dev build the
+    // voice client falls back to a "voice unavailable" message and the rest
+    // of the app keeps working.
+    '@livekit/react-native-expo-plugin',
+    '@config-plugins/react-native-webrtc',
   ],
   extra: {
     apiBaseUrl: process.env.EXPO_PUBLIC_API_BASE_URL,

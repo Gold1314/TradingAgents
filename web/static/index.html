@@ -1059,6 +1059,13 @@ function showCacheBanner(createdAt){
 }
 function renderCached(run){
   currentParams={ticker:run.ticker, trade_date:run.trade_date, asset_type:run.asset_type||"stock"};
+  // Carry the Supabase row id forward so voice (and any other run-scoped
+  // feature added later) keeps working on cache hits. Without this the
+  // "Talk to agent" button silently no-ops because `startVoiceCall` bails on
+  // a missing `activeRunId`. The voice router accepts persisted runs via
+  // `voice_db.get_run_owner`, so an in-memory entry is not required.
+  activeRunId = run.id || null;
+  updateBlueprintLinks();
   const agents=(run.agents||[]).slice().sort((a,b)=>(a.seq||0)-(b.seq||0));
   const nodes=[]; agents.forEach(a=>{ if(!nodes.includes(a.agent)) nodes.push(a.agent); });
   const selAnalysts=nodes.filter(n=>NODE[n]?.stage==="Analysis").length;

@@ -23,16 +23,26 @@ export function AgentCard({
   usage,
   chart,
   chartError,
+  canTalk = false,
+  onTalkRequested,
 }: {
   card: AgentCardState;
   usage?: Usage;
   chart?: ChartPayload | null;
   chartError?: string | null;
+  /**
+   * Show a "Talk to {agent}" button when the agent reaches `done`. Driven by
+   * the `GET /api/voice/config` capability probe so it never appears on
+   * builds without LiveKit credentials.
+   */
+  canTalk?: boolean;
+  onTalkRequested?: (agent: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const meta = agentMetadata(card.node);
   const isChartHost = card.node === CHART_HOST_NODE;
   const isDone = card.status === 'done';
+  const showTalk = canTalk && isDone && onTalkRequested != null;
 
   return (
     <View
@@ -75,6 +85,19 @@ export function AgentCard({
           color={colors.textMuted}
         />
       </TouchTarget>
+
+      {showTalk && (
+        <TouchTarget
+          onPress={() => onTalkRequested?.(card.node)}
+          feedback="scale"
+          style={[styles.talkButton, { borderColor: withAlpha(meta.color, 0.6) }]}
+          accessibilityLabel={`Talk to ${meta.name}`}
+        >
+          <Text style={[styles.talkButtonText, { color: meta.color }]}>
+            🎙  Talk to {meta.name}
+          </Text>
+        </TouchTarget>
+      )}
 
       {expanded && (
         <View style={styles.body}>
@@ -199,5 +222,18 @@ const styles = StyleSheet.create({
     fontSize: fontSize.xs,
     textTransform: 'uppercase',
     letterSpacing: 0.4,
+  },
+  talkButton: {
+    marginTop: spacing.md,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    backgroundColor: withAlpha(colors.surface, 0.6),
+    alignItems: 'center',
+  },
+  talkButtonText: {
+    fontSize: fontSize.sm,
+    fontWeight: '700',
   },
 });

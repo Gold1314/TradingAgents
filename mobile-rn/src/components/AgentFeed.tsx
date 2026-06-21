@@ -1,5 +1,6 @@
 import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
+import { useShallow } from 'zustand/react/shallow';
 import { useRunSession, selectOrderedAgents } from '../state/runSessionStore';
 import { CHART_HOST_NODE } from '../models/agentNode';
 import { AgentCard } from './AgentCard';
@@ -9,9 +10,23 @@ import { colors, fontSize, radius, spacing } from '../theme/theme';
  * The live agent feed: an optional instrument-identity card, then one expandable
  * markdown card per agent in planned pipeline order. The price chart is hosted
  * inside the Market Analyst card (web parity). Ports `AgentFeedView`.
+ *
+ * `voiceReady` + `onTalkRequested` are optional; when both are set, every
+ * `done` card surfaces a "Talk to {agent}" affordance that the parent
+ * screen turns into navigation to `VoiceCallScreen`.
  */
-export function AgentFeed() {
-  const orderedAgents = useRunSession(selectOrderedAgents);
+export function AgentFeed({
+  voiceReady = false,
+  onTalkRequested,
+}: {
+  voiceReady?: boolean;
+  onTalkRequested?: (agent: string) => void;
+} = {}) {
+  // `useShallow` is required because `selectOrderedAgents` returns a fresh
+  // array per call (`.map().filter()`). Without it, Zustand v5's
+  // `useSyncExternalStore` integration detects an unstable snapshot during
+  // active SSE streaming and bails into an infinite re-render loop.
+  const orderedAgents = useRunSession(useShallow(selectOrderedAgents));
   const usageByNode = useRunSession((s) => s.usageByNode);
   const identity = useRunSession((s) => s.identity);
   const chart = useRunSession((s) => s.chart);
@@ -35,6 +50,8 @@ export function AgentFeed() {
           usage={usageByNode[card.node]}
           chart={card.node === CHART_HOST_NODE ? chart : undefined}
           chartError={card.node === CHART_HOST_NODE ? chartError : undefined}
+          canTalk={voiceReady}
+          onTalkRequested={onTalkRequested}
         />
       ))}
     </View>

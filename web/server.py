@@ -573,7 +573,13 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
         run_summary = usage.summary()
         manager.emit(run, {"type": "usage_summary", **run_summary})
 
-        final_state = merged
+        # ``stream_mode="updates"`` only yields each node's *delta*, so ``merged``
+        # never carries the init-state-only keys (``company_of_interest``,
+        # ``trade_date``, ``asset_type``, ``instrument_context``, ``past_context``).
+        # ``_log_state`` reads ``final_state["company_of_interest"]`` directly, so
+        # layer the initial state underneath the streamed deltas to reconstruct the
+        # full state the CLI/values path would have produced.
+        final_state = {**init_state, **merged}
         decision = ta.process_signal(final_state.get("final_trade_decision", ""))
 
         # Persist exactly like _run_graph does (logs + pending memory entry).
@@ -594,9 +600,14 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("clear_checkpoint failed: %s", exc)
 
-        # Persist the run + per-agent outputs to Supabase (fail-open).
+        # Persist the run + per-agent outputs to Supabase (fail-open). Pass the
+        # in-memory ``run_id`` so the Supabase ``runs.id`` matches the id the
+        # client and the voice worker key on. Without this the row gets a fresh
+        # ``gen_random_uuid()`` the out-of-process voice worker can never find,
+        # so every Talk attempt loads no context and disconnects.
         db.store_run(
             meta={
+                "run_id": run.run_id,
                 "ticker": req.ticker,
                 "trade_date": req.trade_date,
                 "asset_type": req.asset_type,

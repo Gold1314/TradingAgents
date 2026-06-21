@@ -94,6 +94,35 @@ final class APIClient {
     /// `\(runsPath)/{run_id}/orders`).
     static let runsPath = "/api/v2/runs"
 
+    // MARK: - Voice-conversational endpoints (additive, default OFF server-side)
+
+    /// `GET /api/voice/config` — capability probe driving the Talk button
+    /// visibility. Returns `enabled=false` (and `ready=false`) when the
+    /// server has the feature off, in which case the UI hides the button.
+    func fetchVoiceConfig() async throws -> VoiceConfig {
+        try await get("/api/voice/config")
+    }
+
+    /// `POST /api/voice/sessions` — mint a LiveKit room JWT for a one-on-one
+    /// voice call with `agentID` on the finished run `runID`. The body is
+    /// `{run_id, agent_id}`. The server gates on the agent being `done`
+    /// (409 otherwise) and on the user's daily voice-minute cap (429).
+    func startVoiceSession(runID: String, agentID: String) async throws -> VoiceSessionStartResponse {
+        let body = VoiceSessionRequest(runID: runID, agentID: agentID)
+        return try await post("/api/voice/sessions", body: body)
+    }
+
+    /// `POST /api/voice/sessions/{id}/reconcile` — Portfolio Manager only.
+    /// Submits the user's objection and returns the (possibly flipped)
+    /// updated rationale. Never re-runs the pipeline; one focused LLM call.
+    func reconcilePortfolioManager(sessionID: String, objection: String) async throws -> VoiceReconcileResponse {
+        let body = VoiceReconcileRequest(objection: objection)
+        return try await post(
+            "/api/voice/sessions/\(sessionID)/reconcile",
+            body: body
+        )
+    }
+
     // MARK: - Verbs
 
     private func get<Response: Decodable>(_ path: String) async throws -> Response {

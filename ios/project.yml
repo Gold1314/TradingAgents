@@ -17,6 +17,15 @@ options:
   createIntermediateGroups: true
   groupSortPosition: top
 
+# Swift Package Manager dependencies. LiveKit Client SDK powers the voice-
+# conversational feature (see ios/StockAgents/Services/VoiceCallClient.swift);
+# the import is conditional on `canImport(LiveKit)` so this can be commented
+# out for builds that don't ship voice yet without breaking compilation.
+packages:
+  LiveKit:
+    url: https://github.com/livekit/client-sdk-swift.git
+    minVersion: "2.0.0"
+
 settings:
   base:
     SWIFT_VERSION: "5.9"
@@ -34,6 +43,9 @@ targets:
     deploymentTarget: "16.0"
     sources:
       - path: StockAgents
+    dependencies:
+      - package: LiveKit
+        product: LiveKit
     info:
       path: StockAgents/Resources/Info.plist
       properties:
@@ -59,6 +71,10 @@ targets:
         # Required for the LocalAuthentication (Face ID) gate on LIVE orders
         # (plan §5.3). Touch ID devices reuse this string via the system prompt.
         NSFaceIDUsageDescription: "StockAgents uses Face ID to confirm and authorize live brokerage orders before they are placed."
+        # Required for the voice-conversational layer (Phase 3 of the voice
+        # roadmap): tapping "Talk" on an agent card opens a LiveKit voice
+        # call. The system shows this string on the first mic prompt.
+        NSMicrophoneUsageDescription: "StockAgents uses your microphone for real-time voice conversations with the AI agents (after a run completes, tap \"Talk\" on any agent card)."
         # Custom URL scheme for the server-mediated Robinhood OAuth bounce-back
         # (stockagents://oauth/robinhood?status=...). ASWebAuthenticationSession
         # matches this scheme to hand the callback URL back to the app (§5.1.3).

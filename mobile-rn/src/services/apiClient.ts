@@ -13,6 +13,14 @@ import {
 } from '../models/run';
 import { parseChartPayload, type ChartPayload } from '../models/chart';
 import type { PlaceOrderRequest } from '../models/order';
+import {
+  parseVoiceConfig,
+  parseVoiceReconcileResponse,
+  parseVoiceSessionStartResponse,
+  type VoiceConfig,
+  type VoiceReconcileResponse,
+  type VoiceSessionStartResponse,
+} from '../models/voice';
 
 /**
  * REST client for the StockAgents backend, ported from the Swift `APIClient`.
@@ -45,9 +53,12 @@ class ApiClient {
 
   /**
    * `POST /api/v2/runs` — start a run (authenticated). Requires a signed-in
-   * session; returns `{cached:false, run_id, nodes}` (the v2 endpoint never
-   * returns a cache hit). On 401 the request transparently refreshes once; a
-   * 429 surfaces as a `rateLimited` error carrying `Retry-After`.
+   * session; mirrors the legacy `/api/runs` discriminator: returns
+   * `{cached:true, run}` on a 60-minute cache hit (same ticker + trade_date,
+   * cache toggle on) and `{cached:false, run_id, nodes}` otherwise. Cache hits
+   * intentionally bypass the per-user run quota. On 401 the request
+   * transparently refreshes once; a 429 surfaces as a `rateLimited` error
+   * carrying `Retry-After`.
    */
   async startRun(request: RunRequest): Promise<StartRunResponse> {
     return parseStartRunResponse(
@@ -87,6 +98,66 @@ class ApiClient {
     if (edits.notional != null) body.notional = edits.notional;
     if (edits.orderType != null) body.order_type = edits.orderType;
     return this.request('POST', `/api/v2/runs/${encodeURIComponent(runId)}/orders`, body);
+  }
+
+  // ── Voice-conversational layer (additive). Default-off until the backend
+  //    is wired with LiveKit + Deepgram + ElevenLabs creds. The capability
+  //    probe drives Talk-button visibility on the agent cards; the start
+  //    endpoint mints a LiveKit room JWT for the React Native LiveKit SDK. ──
+
+  /**
+   * `GET /api/voice/config` — capability probe. The Talk button on each
+   * agent card stays hidden unless `ready === true`. Failures collapse to
+   * `enabled = ready = false` so the rest of the run UI is unaffected when
+   * the optional voice deps aren't installed.
+   */
+  async fetchVoiceConfig(): Promise<VoiceConfig> {
+    try {
+      return parseVoiceConfig(await this.request('GET', '/api/voice/config'));
+    } catch {
+      return {
+        enabled: false,
+        ready: false,
+        reason: 'voice_unavailable',
+        ttsProvider: null,
+        sessionMaxSeconds: null,
+        dailyMinutesPerUser: null,
+        personasCount: null,
+      };
+    }
+  }
+
+  /**
+   * `POST /api/voice/sessions` — mint a LiveKit room JWT for one agent in a
+   * completed run. The room is single-user; concurrent agents from the same
+   * run live in separate rooms (per the plan §8 default).
+   */
+  async startVoiceSession(runId: string, agentId: string): Promise<VoiceSessionStartResponse> {
+    return parseVoiceSessionStartResponse(
+      await this.request('POST', '/api/voice/sessions', {
+        run_id: runId,
+        agent_id: agentId,
+      }),
+    );
+  }
+
+  /**
+   * `POST /api/voice/sessions/{id}/reconcile` — re-invoke the Portfolio
+   * Manager with the user's objection as new context, without re-running
+   * the full pipeline. Surfaces the (possibly flipped) decision and
+   * updated rationale for the in-call composer card.
+   */
+  async reconcilePortfolioManager(
+    sessionId: string,
+    objection: string,
+  ): Promise<VoiceReconcileResponse> {
+    return parseVoiceReconcileResponse(
+      await this.request(
+        'POST',
+        `/api/voice/sessions/${encodeURIComponent(sessionId)}/reconcile`,
+        { objection },
+      ),
+    );
   }
 
   // ── plumbing ──────────────────────────────────────────────────────────

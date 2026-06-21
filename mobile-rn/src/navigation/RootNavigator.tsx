@@ -11,6 +11,7 @@ import { ForgotPasswordScreen } from '../screens/ForgotPasswordScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
 import { RobinhoodConnectScreen } from '../screens/RobinhoodConnectScreen';
 import { OrderTicketScreen } from '../screens/OrderTicketScreen';
+import { VoiceCallScreen } from '../screens/VoiceCallScreen';
 import { TouchTarget } from '../components/primitives';
 import { Icon } from '../components/Icon';
 import { useAuth } from '../hooks/useAuth';
@@ -35,6 +36,8 @@ export type RootStackParamList = {
   Settings: undefined;
   RobinhoodConnect: undefined;
   OrderTicket: { runId: string; trade: TradeEvent };
+  /** Voice call modal — pushed from any agent card's "Talk" button. */
+  VoiceCall: { runId: string; agentId: string };
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -95,6 +98,11 @@ export function RootNavigator() {
             name="OrderTicket"
             component={OrderTicketScreen}
             options={{ title: 'Order ticket', presentation: 'modal' }}
+          />
+          <Stack.Screen
+            name="VoiceCall"
+            component={VoiceCallScreen}
+            options={{ title: 'Voice call', presentation: 'modal' }}
           />
         </>
       ) : (

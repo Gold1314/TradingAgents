@@ -137,6 +137,11 @@ export const useRunSession = create<RunSessionState>((set, get) => ({
       agents,
       usageByNode: {},
       completedNodes: completed,
+      // Carry the original Supabase run_id forward so the voice layer
+      // (Talk button, handoff) keeps working on cached hits. The voice
+      // router accepts persisted runs via its DB-backed owner check —
+      // no in-memory manager entry required.
+      runId: run.runId,
       isCached: true,
       cacheCreatedAt: run.createdAt,
       request: {
