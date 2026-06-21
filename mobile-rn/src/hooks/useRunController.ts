@@ -43,7 +43,9 @@ export function useRunStream(args: RunStreamArgs): void {
         }
         // Stream finished without throwing.
         const phase = store().phase;
-        if (phase === 'streaming' || phase === 'connecting') store().setPhase('finished');
+        if (phase === 'streaming' || phase === 'connecting') {
+          store().markFinished();
+        }
         await activeRunStore.clear();
       } catch (error) {
         if (!cancelled && !controller.signal.aborted) {

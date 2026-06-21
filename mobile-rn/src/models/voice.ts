@@ -16,6 +16,12 @@ export interface VoicePersonaPayload {
   toolGrants: string[];
 }
 
+/** Multi-agent panel info attached to a panel-mode session start response. */
+export interface VoicePanelInfo {
+  agentIds: string[];
+  personas: VoicePersonaPayload[];
+}
+
 /** Response to `POST /api/voice/sessions`. */
 export interface VoiceSessionStartResponse {
   sessionId: string;
@@ -25,6 +31,12 @@ export interface VoiceSessionStartResponse {
   persona: VoicePersonaPayload;
   expiresIn: number;
   sessionMaxSeconds: number;
+  /**
+   * When the session is a 2-3 persona group call, the full roster + every
+   * panelist's persona payload. `null` for the legacy single-agent path so
+   * older call-sites can ignore it.
+   */
+  panel: VoicePanelInfo | null;
 }
 
 /** Capability probe (`GET /api/voice/config`) that drives Talk-button visibility. */
@@ -36,6 +48,14 @@ export interface VoiceConfig {
   sessionMaxSeconds: number | null;
   dailyMinutesPerUser: number | null;
   personasCount: number | null;
+  /**
+   * Whether the multi-agent panel/group-call mode is enabled on this build.
+   * Independent of `enabled` — single-agent voice can be on while the panel
+   * rollout is still off. Drives the visibility of the "Group call" button.
+   */
+  panelEnabled: boolean;
+  /** Server-enforced cap on the number of personas one panel can host. */
+  panelMaxSize: number;
 }
 
 /** One row in the live in-call transcript. Partial rows are coalesced. */
@@ -44,6 +64,12 @@ export interface VoiceTranscriptEntry {
   role: 'user' | 'assistant' | 'reconcile';
   text: string;
   isPartial: boolean;
+  /**
+   * For panel-mode assistant turns, the persona who spoke this utterance.
+   * `null` for user/reconcile rows and for single-agent assistant rows
+   * (where it's redundant — the persona is the session's only agent).
+   */
+  speakerAgentId: string | null;
 }
 
 /** Handoff target the agent has suggested during a call. */
@@ -99,6 +125,19 @@ export function parseVoiceSessionStartResponse(raw: unknown): VoiceSessionStartR
     persona: parseVoicePersona(obj.persona),
     expiresIn: asNumber(obj.expires_in) ?? 0,
     sessionMaxSeconds: asNumber(obj.session_max_seconds) ?? 0,
+    panel: parseVoicePanel(obj.panel),
+  };
+}
+
+function parseVoicePanel(raw: unknown): VoicePanelInfo | null {
+  if (raw == null) return null;
+  const obj = raw as Json;
+  const agentIds = asStringArray(obj.agent_ids);
+  if (agentIds.length === 0) return null;
+  const rawPersonas = Array.isArray(obj.personas) ? obj.personas : [];
+  return {
+    agentIds,
+    personas: rawPersonas.map((p) => parseVoicePersona(p)),
   };
 }
 
@@ -112,6 +151,8 @@ export function parseVoiceConfig(raw: unknown): VoiceConfig {
     sessionMaxSeconds: asNumber(obj.session_max_seconds),
     dailyMinutesPerUser: asNumber(obj.daily_minutes_per_user),
     personasCount: asNumber(obj.personas_count),
+    panelEnabled: Boolean(obj.panel_enabled),
+    panelMaxSize: asNumber(obj.panel_max_size) ?? 3,
   };
 }
 

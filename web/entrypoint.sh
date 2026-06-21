@@ -38,7 +38,28 @@ if [ -n "${ROBINHOOD_TOKEN_JSON:-}" ] && [ ! -f "$TOKEN_PATH" ]; then
     echo "[entrypoint] Seeded Robinhood token at $TOKEN_PATH"
 fi
 
-if [ "$IS_ROOT" = "1" ]; then
-    exec gosu "$APP_USER" uvicorn web.server:app --host 0.0.0.0 --port "${PORT:-8000}"
-fi
-exec uvicorn web.server:app --host 0.0.0.0 --port "${PORT:-8000}"
+# STOCKAGENTS_PROCESS selects which long-running process to start in this
+# container. Default "web" runs the FastAPI app; "voice-worker" runs the
+# LiveKit Agents worker (deploy as a second Railway service with the same
+# image + env, but no HTTP health check).
+PROCESS="${STOCKAGENTS_PROCESS:-web}"
+
+run_as_appuser() {
+    if [ "$IS_ROOT" = "1" ]; then
+        exec gosu "$APP_USER" "$@"
+    fi
+    exec "$@"
+}
+
+case "$PROCESS" in
+    web)
+        run_as_appuser uvicorn web.server:app --host 0.0.0.0 --port "${PORT:-8000}"
+        ;;
+    voice-worker)
+        run_as_appuser python -m tradingagents.voice.agent_worker
+        ;;
+    *)
+        echo "[entrypoint] Unknown STOCKAGENTS_PROCESS=$PROCESS (expected web or voice-worker)" >&2
+        exit 1
+        ;;
+esac

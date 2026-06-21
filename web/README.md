@@ -97,6 +97,58 @@ The repo ships deploy config for Railway:
 4. **Generate a domain**: Service ▸ *Settings ▸ Networking ▸ Generate Domain*.
    Open it — you're live.
 
+### Mobile app + voice on Railway (no Mac required)
+
+Use **two services** in the same Railway project, both from this repo /
+`Dockerfile.web`, sharing the same Variables (Railway shared variable group
+or copy-paste):
+
+| Service | `STOCKAGENTS_PROCESS` | Public domain | Health check |
+| --- | --- | --- | --- |
+| **web** | unset or `web` | **Yes** — generate a domain | `/api/config` (default) |
+| **voice-worker** | `voice-worker` | **No** — internal only | **Disable** (no HTTP server) |
+
+Copy your local `.env` voice + mobile keys onto **both** services, including at
+minimum:
+
+```
+MOBILE_API_ENABLED=true
+MOBILE_AUTH_MODE=supabase
+TRADINGAGENTS_VOICE_ENABLED=true
+LIVEKIT_URL=...
+LIVEKIT_API_KEY=...
+LIVEKIT_API_SECRET=...
+DEEPGRAM_API_KEY=...
+ELEVENLABS_API_KEY=...
+ANTHROPIC_API_KEY=...
+SUPABASE_URL=...
+SUPABASE_KEY=...          # service role — server only, never in the mobile app
+```
+
+On the **web** service only, also set:
+
+```
+MOBILE_PUBLIC_BASE_URL=https://<your-web-service>.up.railway.app
+```
+
+Rebuild the iPhone app with the HTTPS web URL baked in:
+
+```
+EXPO_PUBLIC_API_BASE_URL=https://<your-web-service>.up.railway.app
+EXPO_PUBLIC_SUPABASE_URL=...
+EXPO_PUBLIC_SUPABASE_ANON_KEY=...    # anon key, NOT SUPABASE_KEY
+```
+
+Then `eas build --profile development --platform ios` (or your existing profile)
+and reinstall. The phone no longer needs your Mac or LAN IP.
+
+Verify from any network:
+
+```bash
+curl https://<your-web-service>.up.railway.app/api/config
+curl https://<your-web-service>.up.railway.app/api/voice/config
+```
+
 ### Important notes
 
 - **Single replica only.** Run state (the SSE run registry) lives in process

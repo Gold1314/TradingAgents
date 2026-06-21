@@ -41,6 +41,8 @@ from tradingagents.voice.context_loader import (
 )
 from tradingagents.voice.handoff import (
     KIND_HANDOFF_SUGGESTED,
+    KIND_PANEL_TURN_END,
+    KIND_PANEL_TURN_START,
     KIND_RECONCILE_REQUESTED,
     KIND_TRANSCRIPT_FINAL,
     KIND_TRANSCRIPT_PARTIAL,
@@ -48,6 +50,11 @@ from tradingagents.voice.handoff import (
     coalesce_handoffs,
     detect_handoff,
     detect_reconcile_request,
+)
+from tradingagents.voice.panel import (
+    PanelUtterance,
+    build_panel_system_prompt,
+    parse_orchestrator_output,
 )
 from tradingagents.voice.personas import VoicePersona, get_persona
 from tradingagents.voice.settings import VoiceSettings, load_settings
@@ -104,6 +111,9 @@ class _SessionAccumulators:
     input_tokens: int = 0
     output_tokens: int = 0
     handoffs: List[Any] = field(default_factory=list)
+    # Panel mode only — per-persona TTS audio seconds for cost slicing. Keyed
+    # by ``agent_id``; empty in single-agent sessions.
+    tts_seconds_by_persona: Dict[str, float] = field(default_factory=dict)
 
 
 # Sentinel: imports that may fail without the optional install. Resolved
@@ -217,6 +227,126 @@ def _build_vad() -> Any:
     return silero.VAD.load()
 
 
+def _build_panel_agent(
+    *,
+    instructions: str,
+    personas_by_id: Dict[str, VoicePersona],
+    tts_by_persona: Dict[str, Any],
+    room: Any,
+    session_id: str,
+    accum: _SessionAccumulators,
+) -> Any:
+    """Build a LiveKit ``Agent`` that routes each utterance through the right TTS.
+
+    Returns a subclass of ``livekit.agents.voice.Agent`` with the
+    ``tts_node`` hook overridden so we can:
+
+    1. Stream the LLM's full output into memory (it's a panel JSON array
+       — small).
+    2. Parse it via :func:`panel.parse_orchestrator_output` (tolerant —
+       never raises).
+    3. For each :class:`PanelUtterance`, switch to that persona's TTS plugin
+       and yield its synthesized audio frames. Between utterances we publish
+       ``panel.turn_start`` / ``panel.turn_end`` data-channel events so the
+       UI can pulse the active speaker's avatar.
+
+    On parse failure (the LLM emitted prose, not JSON), we fall back to
+    treating the whole text as one utterance from the first persona — the
+    user still hears something instead of dead air.
+
+    Built inside the worker because it closes over ``room``, ``accum``, and
+    the live TTS instances. Kept top-level to keep the entrypoint readable.
+    """
+    from livekit.agents.voice import Agent  # noqa: PLC0415 — vendor type only at runtime
+
+    allowed_ids = set(personas_by_id.keys())
+    primary_id = next(iter(personas_by_id))
+
+    class PanelAgent(Agent):
+        async def tts_node(self, text: Any, model_settings: Any) -> Any:
+            # Aggregate the streamed LLM output. Panel JSON is short
+            # (typically <2 KB) so reading the full stream before TTS adds
+            # negligible latency vs. the multiple TTS round-trips that
+            # dominate the budget.
+            buffer = ""
+            try:
+                async for chunk in text:
+                    if isinstance(chunk, str):
+                        buffer += chunk
+                    else:
+                        buffer += str(chunk)
+            except TypeError:
+                # Forward-compat: some plugin versions pass a plain string.
+                buffer = str(text)
+
+            utterances = parse_orchestrator_output(
+                buffer, allowed_persona_ids=allowed_ids
+            )
+            if not utterances:
+                utterances = [
+                    PanelUtterance(persona_agent_id=primary_id, text=buffer.strip())
+                ]
+
+            for utterance in utterances:
+                pid = utterance.persona_agent_id
+                persona = personas_by_id.get(pid) or personas_by_id[primary_id]
+                tts = tts_by_persona.get(pid) or tts_by_persona[primary_id]
+
+                await _publish_data_event(
+                    room,
+                    {
+                        "kind": KIND_PANEL_TURN_START,
+                        "session_id": session_id,
+                        "agent_id": persona.agent_id,
+                        "voice_name": persona.voice_name,
+                    },
+                )
+                # Publish the per-utterance transcript event up front so the
+                # UI can render the line while the audio is still streaming.
+                await _publish_data_event(
+                    room,
+                    {
+                        "kind": KIND_TRANSCRIPT_FINAL,
+                        "role": "assistant",
+                        "text": utterance.text,
+                        "speaker_agent_id": persona.agent_id,
+                    },
+                )
+
+                # ``tts.synthesize`` returns a ``ChunkedStream`` in
+                # livekit-plugins 1.x; iterating it yields ``SynthesizedAudio``
+                # whose ``frame`` is the ``rtc.AudioFrame`` LiveKit expects
+                # to pass back out of ``tts_node``. Wrapped in try/except so
+                # one persona's TTS hiccup doesn't kill the whole turn.
+                synth_started = time.time()
+                try:
+                    stream = tts.synthesize(utterance.text)
+                    async for audio in stream:
+                        frame = getattr(audio, "frame", None) or audio
+                        yield frame
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "panel tts dispatch failed for %s: %s", persona.agent_id, exc
+                    )
+
+                synth_elapsed = max(0.0, time.time() - synth_started)
+                accum.tts_seconds_by_persona[persona.agent_id] = (
+                    accum.tts_seconds_by_persona.get(persona.agent_id, 0.0)
+                    + synth_elapsed
+                )
+
+                await _publish_data_event(
+                    room,
+                    {
+                        "kind": KIND_PANEL_TURN_END,
+                        "session_id": session_id,
+                        "agent_id": persona.agent_id,
+                    },
+                )
+
+    return PanelAgent(instructions=instructions)
+
+
 async def _publish_data_event(room: Any, payload: dict) -> None:
     """Publish a small JSON payload on the LiveKit data channel.
 
@@ -275,10 +405,27 @@ async def entrypoint(ctx: Any) -> None:
         logger.error("voice room missing required metadata: %s", metadata)
         return
 
-    persona = get_persona(agent_id)
-    if persona is None:
-        logger.error("unknown agent_id from room metadata: %s", agent_id)
-        return
+    # Multi-agent ("panel") sessions carry ``agent_ids`` in addition to the
+    # legacy ``agent_id`` field. ``agent_id`` is always the first entry of
+    # ``agent_ids`` so older workers that only read ``agent_id`` still pick
+    # up a sane persona — they'll just collapse the panel down to a
+    # single-agent call (graceful degradation when this worker is rolled
+    # out behind the router).
+    metadata_agent_ids = metadata.get("agent_ids")
+    if isinstance(metadata_agent_ids, list) and metadata_agent_ids:
+        agent_ids: List[str] = [str(a) for a in metadata_agent_ids if a]
+    else:
+        agent_ids = [str(agent_id)]
+    is_panel = len(agent_ids) > 1
+
+    personas: List[VoicePersona] = []
+    for aid in agent_ids:
+        resolved = get_persona(aid)
+        if resolved is None:
+            logger.error("unknown agent_id from room metadata: %s", aid)
+            return
+        personas.append(resolved)
+    persona = personas[0]
 
     run_context = load_run_context(run_id, manager=None)
     if run_context is None:
@@ -308,19 +455,35 @@ async def entrypoint(ctx: Any) -> None:
         await ctx.room.disconnect()
         return
 
-    system_prompt = build_system_prompt(persona, run_context)
+    if is_panel:
+        system_prompt = build_panel_system_prompt(personas, run_context)
+    else:
+        system_prompt = build_system_prompt(persona, run_context)
     logger.info(
-        "voice session start: session=%s agent=%s run=%s user=%s",
+        "voice session start: session=%s mode=%s agents=%s run=%s user=%s",
         session_id,
-        agent_id,
+        "panel" if is_panel else "single",
+        agent_ids,
         run_id,
         user_id,
     )
 
+    # Build one TTS plugin per persona. Single-agent sessions only use the
+    # first; panel sessions swap per utterance in :class:`PanelAgent`. We
+    # build them eagerly so the in-call latency is purely the synth call,
+    # not "construct + auth + synth" on first use.
+    tts_by_persona: Dict[str, Any] = {
+        p.agent_id: _build_tts(settings, p) for p in personas
+    }
+    personas_by_id: Dict[str, VoicePersona] = {p.agent_id: p for p in personas}
+    panel_ids_set = set(agent_ids)
+
     session = AgentSession(
         stt=_build_stt(settings),
         llm=_build_llm(settings, persona),
-        tts=_build_tts(settings, persona),
+        # Default TTS is the primary persona's; in panel mode our custom
+        # Agent overrides ``tts_node`` and routes per utterance instead.
+        tts=tts_by_persona[persona.agent_id],
         vad=_build_vad(),
     )
 
@@ -374,9 +537,14 @@ async def entrypoint(ctx: Any) -> None:
             {"kind": KIND_TRANSCRIPT_FINAL, "role": "user", "text": text, "idx": accum.turn_index},
         )
 
-    async def _on_assistant_final(text: str) -> None:
-        accum.turn_index += 1
-        # Latency: ms from last user ASR-final to assistant turn final.
+    async def _emit_latency_if_pending() -> None:
+        """Publish the per-turn round-trip if we have a pending user ASR final.
+
+        Shared by single-agent and panel paths so the dashboard math is the
+        same for both. The first assistant utterance in a turn anchors the
+        latency timestamp; subsequent panel utterances within the same turn
+        don't re-emit.
+        """
         if last_user_final_at["t"]:
             rtt_ms = int((time.time() - last_user_final_at["t"]) * 1000.0)
             await _publish_data_event(
@@ -389,6 +557,11 @@ async def entrypoint(ctx: Any) -> None:
                 },
             )
             last_user_final_at["t"] = 0.0
+
+    async def _persist_assistant_turn(
+        text: str, *, speaker_agent_id: Optional[str] = None
+    ) -> None:
+        accum.turn_index += 1
         await asyncio.to_thread(
             _persist_turn,
             session_id=session_id,
@@ -399,13 +572,47 @@ async def entrypoint(ctx: Any) -> None:
             model=settings.elevenlabs_model
             if settings.tts_provider == "elevenlabs"
             else "cartesia-sonic",
+            speaker_agent_id=speaker_agent_id,
         )
+
+    async def _on_assistant_final(text: str) -> None:
+        await _emit_latency_if_pending()
+
+        if is_panel:
+            # In panel mode the raw assistant output is a JSON array (or
+            # bracket-prose fallback). The PanelAgent.tts_node override has
+            # already dispatched audio per utterance; here we just persist
+            # each utterance as its own turn so the replay UI can attribute
+            # lines to the right persona. We deliberately do NOT re-publish
+            # ``transcript.final`` from this hook because the tts_node path
+            # already published one per utterance with ``speaker_agent_id``.
+            utterances = parse_orchestrator_output(
+                text, allowed_persona_ids=panel_ids_set
+            )
+            if not utterances:
+                # The orchestrator emitted something we couldn't parse. Save
+                # the raw text as a single primary-persona turn so the
+                # transcript isn't silently dropped; the UI still renders
+                # *something* the user can match to the audio they heard.
+                await _persist_assistant_turn(
+                    text, speaker_agent_id=persona.agent_id
+                )
+                return
+            for utterance in utterances:
+                await _persist_assistant_turn(
+                    utterance.text,
+                    speaker_agent_id=utterance.persona_agent_id,
+                )
+            return
+
+        await _persist_assistant_turn(text)
         # Handoff intent detection — scan the assistant's words for "bring in
         # the Bear", etc. Emit at most one signal per session per target.
         suggestion = detect_handoff(
             text,
             source_agent_id=persona.agent_id,
             allowed_targets=persona.handoff_targets,
+            already_in_session=agent_ids,
         )
         if suggestion is not None:
             existing = {h.target_agent_id for h in accum.handoffs}
@@ -414,7 +621,12 @@ async def entrypoint(ctx: Any) -> None:
                 await _publish_data_event(ctx.room, suggestion.to_dict())
         await _publish_data_event(
             ctx.room,
-            {"kind": KIND_TRANSCRIPT_FINAL, "role": "assistant", "text": text, "idx": accum.turn_index},
+            {
+                "kind": KIND_TRANSCRIPT_FINAL,
+                "role": "assistant",
+                "text": text,
+                "idx": accum.turn_index,
+            },
         )
 
     # The 1.0 session emits ``user_input_transcribed`` and
@@ -457,14 +669,30 @@ async def entrypoint(ctx: Any) -> None:
     asyncio.create_task(_terminate_after_max())
 
     # ── Start the session and let the agent greet ──────────────────────
-    agent = Agent(instructions=system_prompt)
+    if is_panel:
+        agent = _build_panel_agent(
+            instructions=system_prompt,
+            personas_by_id=personas_by_id,
+            tts_by_persona=tts_by_persona,
+            room=ctx.room,
+            session_id=session_id,
+            accum=accum,
+        )
+    else:
+        agent = Agent(instructions=system_prompt)
     await session.start(agent=agent, room=ctx.room)
 
-    # The persona's short_intro is delivered as the agent's first utterance.
-    # We don't pass it as user input — calling generate_reply with the intro
-    # as the assistant's seed makes the model adopt it cleanly.
+    # Opener: single-agent sessions deliver the persona's ``short_intro`` as
+    # the first utterance. Panel sessions ask the orchestrator to walk each
+    # panelist through their one-liner in roster order (built into the
+    # system prompt's OPENER block).
+    opener_instructions = (
+        "Have each panelist deliver their opener line in roster order."
+        if is_panel
+        else f"Open with this exact line: {persona.short_intro}"
+    )
     try:
-        await session.generate_reply(instructions=f"Open with this exact line: {persona.short_intro}")
+        await session.generate_reply(instructions=opener_instructions)
     except Exception as exc:  # noqa: BLE001 — opener failure is non-fatal
         logger.warning("voice opener failed: %s", exc)
 

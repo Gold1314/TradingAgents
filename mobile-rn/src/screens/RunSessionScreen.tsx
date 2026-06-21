@@ -1,13 +1,15 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { View, Text, Pressable, ScrollView, StyleSheet } from 'react-native';
+import { useShallow } from 'zustand/react/shallow';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import type { RootStackParamList } from '../navigation/RootNavigator';
-import { useRunSession, type RunPhase } from '../state/runSessionStore';
+import { useRunSession, selectOrderedAgents, type RunPhase } from '../state/runSessionStore';
 import { useRunStream, useChart } from '../hooks/useRunController';
 import { StageStepper } from '../components/StageStepper';
 import { VerdictHero } from '../components/VerdictHero';
 import { Economics } from '../components/Economics';
 import { AgentFeed } from '../components/AgentFeed';
+import { PanelPicker } from '../components/PanelPicker';
 import { Banner } from '../components/primitives';
 import { isActionable } from '../models/order';
 import { apiClient } from '../services/apiClient';
@@ -70,18 +72,32 @@ export function RunSessionScreen({ route, navigation }: Props) {
     });
   }, [navigation, chartArgs.ticker, chartArgs.tradeDate]);
 
-  // Capability probe for the Talk button. Failures collapse to `false` so the
-  // rest of the run UI is unaffected — see `apiClient.fetchVoiceConfig`.
+  // Capability probe for the Talk + Group Call buttons. Failures collapse to
+  // off so the rest of the run UI is unaffected — see
+  // `apiClient.fetchVoiceConfig`. ``panelReady`` is independent of
+  // ``voiceReady``: the server can keep panel mode off while single-agent
+  // voice ships, in which case we hide the Group Call entry point.
   const [voiceReady, setVoiceReady] = useState(false);
+  const [panelReady, setPanelReady] = useState(false);
+  const [panelMaxSize, setPanelMaxSize] = useState(3);
   useEffect(() => {
     let cancelled = false;
     void apiClient.fetchVoiceConfig().then((cfg) => {
-      if (!cancelled) setVoiceReady(cfg.ready);
+      if (cancelled) return;
+      setVoiceReady(cfg.ready);
+      setPanelReady(cfg.ready && cfg.panelEnabled);
+      setPanelMaxSize(cfg.panelMaxSize);
     });
     return () => {
       cancelled = true;
     };
   }, []);
+
+  // Panel picker state — opened from the per-card "Group call" button with
+  // that agent pre-checked.
+  const [panelPickerOpen, setPanelPickerOpen] = useState(false);
+  const [panelPreselect, setPanelPreselect] = useState<string | null>(null);
+  const orderedAgents = useRunSession(useShallow(selectOrderedAgents));
 
   const phase = useRunSession((s) => s.phase);
   const statusMessage = useRunSession((s) => s.statusMessage);
@@ -131,6 +147,29 @@ export function RunSessionScreen({ route, navigation }: Props) {
             ? (agentId) => navigation.navigate('VoiceCall', { runId, agentId })
             : undefined
         }
+        panelReady={panelReady && runId != null}
+        onGroupCallRequested={
+          runId != null
+            ? (agentId) => {
+                setPanelPreselect(agentId);
+                setPanelPickerOpen(true);
+              }
+            : undefined
+        }
+      />
+
+      <PanelPicker
+        visible={panelPickerOpen}
+        candidates={orderedAgents}
+        preselected={panelPreselect}
+        maxSize={panelMaxSize}
+        onClose={() => setPanelPickerOpen(false)}
+        onConfirm={(agentIds) => {
+          setPanelPickerOpen(false);
+          if (runId != null) {
+            navigation.navigate('VoiceCall', { runId, agentIds });
+          }
+        }}
       />
     </ScrollView>
   );

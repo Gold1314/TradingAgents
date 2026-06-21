@@ -44,10 +44,24 @@ export type VoiceClientEvent =
       role: 'user' | 'assistant' | 'reconcile';
       text: string;
       isFinal: boolean;
+      /**
+       * For assistant turns inside a panel session, the persona who spoke
+       * this line. `null` for user/reconcile rows and for single-agent
+       * assistant rows.
+       */
+      speakerAgentId: string | null;
     }
   | { type: 'handoff'; targetAgentId: string; quote: string }
   | { type: 'reconcileRequested'; objection: string }
-  | { type: 'latency'; rttMs: number; turn: number };
+  | { type: 'latency'; rttMs: number; turn: number }
+  /**
+   * Panel-mode utterance markers. The worker emits `panelTurnStart`
+   * immediately before dispatching a persona's TTS audio and
+   * `panelTurnEnd` once that synth is complete. The UI uses them to pulse
+   * the active speaker's avatar in real time.
+   */
+  | { type: 'panelTurnStart'; agentId: string; voiceName: string | null }
+  | { type: 'panelTurnEnd'; agentId: string };
 
 export type VoiceClientListener = (event: VoiceClientEvent) => void;
 
@@ -196,6 +210,7 @@ export class VoiceClient {
               role: parseRole(json.role),
               text: typeof json.text === 'string' ? json.text : '',
               isFinal: false,
+              speakerAgentId: parseSpeakerAgentId(json.speaker_agent_id),
             });
             break;
           case 'transcript.final':
@@ -204,6 +219,20 @@ export class VoiceClient {
               role: parseRole(json.role),
               text: typeof json.text === 'string' ? json.text : '',
               isFinal: true,
+              speakerAgentId: parseSpeakerAgentId(json.speaker_agent_id),
+            });
+            break;
+          case 'panel.turn_start':
+            this.emit({
+              type: 'panelTurnStart',
+              agentId: typeof json.agent_id === 'string' ? json.agent_id : '',
+              voiceName: typeof json.voice_name === 'string' ? json.voice_name : null,
+            });
+            break;
+          case 'panel.turn_end':
+            this.emit({
+              type: 'panelTurnEnd',
+              agentId: typeof json.agent_id === 'string' ? json.agent_id : '',
             });
             break;
           case 'handoff.suggested': {
@@ -256,6 +285,10 @@ function parseRole(value: unknown): 'user' | 'assistant' | 'reconcile' {
     default:
       return 'assistant';
   }
+}
+
+function parseSpeakerAgentId(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
 function describe(err: unknown): string {

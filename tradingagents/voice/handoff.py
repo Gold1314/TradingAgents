@@ -30,6 +30,14 @@ KIND_TRANSCRIPT_PARTIAL = "transcript.partial"
 KIND_TRANSCRIPT_FINAL = "transcript.final"
 KIND_USAGE = "usage"
 
+# Panel-mode events: bracket each persona's spoken utterance so the in-call
+# UI can pulse the active speaker's avatar in real time. ``turn_start`` is
+# emitted just before the worker dispatches that persona's TTS chunk;
+# ``turn_end`` lands when the audio has been synthesised (not necessarily
+# fully played — clients should treat the gap as "still speaking").
+KIND_PANEL_TURN_START = "panel.turn_start"
+KIND_PANEL_TURN_END = "panel.turn_end"
+
 
 @dataclass(frozen=True)
 class HandoffSuggested:
@@ -96,18 +104,24 @@ def detect_handoff(
     *,
     source_agent_id: str,
     allowed_targets: Iterable[str],
+    already_in_session: Iterable[str] = (),
 ) -> Optional[HandoffSuggested]:
     """Scan an assistant utterance for a handoff intent.
 
     Returns at most one :class:`HandoffSuggested`. We pick the *first* allowed
     target named within the search window after an intent phrase. If no intent
     phrase matches, returns ``None``.
+
+    ``already_in_session`` lets a panel session suppress the suggestion when
+    the target persona is already on the call (e.g. on a Bull/Bear panel,
+    "let me bring in the Bear" is a no-op because the Bear is right there).
     """
     if not utterance:
         return None
     targets = list(allowed_targets)
     if not targets:
         return None
+    in_session = {a for a in already_in_session if a}
     for intent in _INTENT_RE.finditer(utterance):
         window_start = intent.end()
         window = utterance[window_start : window_start + _TARGET_SEARCH_WINDOW]
@@ -116,6 +130,9 @@ def detect_handoff(
             pat = re.compile(r"\b" + re.escape(target) + r"\b", flags=re.IGNORECASE)
             m = pat.search(window)
             if m:
+                if target in in_session:
+                    # Caller is already on the panel — surface no chip.
+                    return None
                 quote = _extract_quote(utterance, intent.start(), window_start + m.end())
                 return HandoffSuggested(
                     source_agent_id=source_agent_id,

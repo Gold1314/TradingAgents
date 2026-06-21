@@ -36,8 +36,22 @@ export type RootStackParamList = {
   Settings: undefined;
   RobinhoodConnect: undefined;
   OrderTicket: { runId: string; trade: TradeEvent };
-  /** Voice call modal — pushed from any agent card's "Talk" button. */
-  VoiceCall: { runId: string; agentId: string };
+  /**
+   * Voice call modal — pushed from any agent card's "Talk" button (single
+   * agent) or the "Group call" sheet (panel of 2-3 personas).
+   *
+   * The two modes share a screen but differ in payload:
+   * - `agentId`: legacy single-agent call.
+   * - `agentIds`: 2-3 personas, the orchestrator decides who speaks each
+   *   turn (see `tradingagents/voice/panel.py`).
+   *
+   * The screen owns the discrimination — both fields cannot be set
+   * simultaneously; the screen prefers `agentIds` when both happen to be
+   * present (defensive — should never come up via normal navigation).
+   */
+  VoiceCall:
+    | { runId: string; agentId: string; agentIds?: undefined }
+    | { runId: string; agentIds: string[]; agentId?: undefined };
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();

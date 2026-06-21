@@ -123,21 +123,36 @@ class ApiClient {
         sessionMaxSeconds: null,
         dailyMinutesPerUser: null,
         personasCount: null,
+        panelEnabled: false,
+        panelMaxSize: 3,
       };
     }
   }
 
   /**
-   * `POST /api/voice/sessions` — mint a LiveKit room JWT for one agent in a
-   * completed run. The room is single-user; concurrent agents from the same
-   * run live in separate rooms (per the plan §8 default).
+   * `POST /api/voice/sessions` — mint a LiveKit room JWT for a voice call on
+   * a completed run.
+   *
+   * Two shapes are accepted by the backend (mirrored here):
+   * - Single agent: pass an `agentId` string (legacy v1 contract).
+   * - Panel (2-3 personas): pass an `agentIds` array; the server returns a
+   *   `panel` payload alongside the primary persona.
+   *
+   * Callers wanting single-agent semantics should use the first overload; the
+   * panel overload is opt-in from the "Group call" sheet only.
    */
-  async startVoiceSession(runId: string, agentId: string): Promise<VoiceSessionStartResponse> {
+  async startVoiceSession(
+    runId: string,
+    agents: { agentId: string } | { agentIds: string[] },
+  ): Promise<VoiceSessionStartResponse> {
+    const body: Record<string, unknown> = { run_id: runId };
+    if ('agentIds' in agents) {
+      body.agent_ids = agents.agentIds;
+    } else {
+      body.agent_id = agents.agentId;
+    }
     return parseVoiceSessionStartResponse(
-      await this.request('POST', '/api/voice/sessions', {
-        run_id: runId,
-        agent_id: agentId,
-      }),
+      await this.request('POST', '/api/voice/sessions', body),
     );
   }
 
