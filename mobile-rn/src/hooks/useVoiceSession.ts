@@ -6,27 +6,12 @@ import {
 } from '../services/voiceClient';
 import type {
   VoiceHandoff,
-  VoicePanelInfo,
   VoicePersonaPayload,
   VoiceReconcileResponse,
   VoiceSessionStartResponse,
   VoiceTranscriptEntry,
 } from '../models/voice';
 import { describeError } from '../services/apiError';
-
-/**
- * Identifies which voice mode the session is in.
- *
- * - `single`: one persona, the legacy path. `agentId` is the lone agent.
- * - `panel`: 2-3 personas. `agentIds` is the full roster; the orchestrator
- *   decides which subset speaks each turn.
- *
- * Both modes route through the same `POST /api/voice/sessions` endpoint and
- * the same LiveKit room transport — they just differ in payload + UI.
- */
-export type VoiceSessionTarget =
-  | { mode: 'single'; agentId: string }
-  | { mode: 'panel'; agentIds: string[] };
 
 /**
  * Phase the in-call screen is in. Determines which controls are enabled and
@@ -44,12 +29,7 @@ export interface VoiceSessionState {
   phase: VoicePhase;
   status: string;
   errorMessage: string | null;
-  /** Primary persona (single-agent: the only one; panel: the first panelist). */
   persona: VoicePersonaPayload | null;
-  /** Full panel roster + personas when this is a panel call; `null` otherwise. */
-  panel: VoicePanelInfo | null;
-  /** When in panel mode, which panelist is currently speaking. `null` for single-agent or between utterances. */
-  activeSpeakerAgentId: string | null;
   sessionId: string | null;
   /** Live transcript, partial rows coalesced per role. */
   transcript: VoiceTranscriptEntry[];
@@ -85,16 +65,11 @@ export interface VoiceSessionActions {
  * which re-invokes the Portfolio Manager with the user's objection as new
  * context (no full pipeline rerun) and returns the updated rationale.
  */
-export function useVoiceSession(
-  runId: string,
-  target: VoiceSessionTarget,
-): VoiceSessionState & VoiceSessionActions {
+export function useVoiceSession(runId: string, agentId: string): VoiceSessionState & VoiceSessionActions {
   const [phase, setPhase] = useState<VoicePhase>('idle');
   const [status, setStatus] = useState<string>('Idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [persona, setPersona] = useState<VoicePersonaPayload | null>(null);
-  const [panel, setPanel] = useState<VoicePanelInfo | null>(null);
-  const [activeSpeakerAgentId, setActiveSpeakerAgentId] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [transcript, setTranscript] = useState<VoiceTranscriptEntry[]>([]);
   const [handoffs, setHandoffs] = useState<VoiceHandoff[]>([]);
@@ -153,14 +128,6 @@ export function useVoiceSession(
           setP95TurnLatencyMs(percentile(buf, 95));
           break;
         }
-        case 'panelTurnStart':
-          setActiveSpeakerAgentId(event.agentId);
-          break;
-        case 'panelTurnEnd':
-          // Clear only if this end matches the active speaker — protects
-          // against out-of-order delivery where the next start landed first.
-          setActiveSpeakerAgentId((prev) => (prev === event.agentId ? null : prev));
-          break;
         default: {
           // Exhaustiveness guard — adding a new variant must force a fix here.
           const _never: never = event;
@@ -178,12 +145,7 @@ export function useVoiceSession(
     setStatus('Preparing call…');
     let started: VoiceSessionStartResponse;
     try {
-      started = await apiClient.startVoiceSession(
-        runId,
-        target.mode === 'panel'
-          ? { agentIds: target.agentIds }
-          : { agentId: target.agentId },
-      );
+      started = await apiClient.startVoiceSession(runId, agentId);
     } catch (err) {
       setErrorMessage(describeError(err));
       setPhase('failed');
@@ -192,7 +154,6 @@ export function useVoiceSession(
     }
     setSessionId(started.sessionId);
     setPersona(started.persona);
-    setPanel(started.panel);
     setPhase('connecting');
     setStatus('Connecting…');
 
@@ -203,7 +164,7 @@ export function useVoiceSession(
     });
     clientRef.current = client;
     await client.start();
-  }, [phase, runId, target, handleEvent]);
+  }, [phase, runId, agentId, handleEvent]);
 
   const hangup = useCallback(async () => {
     const client = clientRef.current;
@@ -238,7 +199,6 @@ export function useVoiceSession(
             role: 'reconcile',
             text: result.rationaleMarkdown,
             isPartial: false,
-            speakerAgentId: null,
           },
         ]);
       } catch (err) {
@@ -249,7 +209,6 @@ export function useVoiceSession(
     },
     [sessionId, allocId],
   );
-
 
   const dismissReconcile = useCallback(() => setReconcile(null), []);
 
@@ -267,8 +226,6 @@ export function useVoiceSession(
       status,
       errorMessage,
       persona,
-      panel,
-      activeSpeakerAgentId,
       sessionId,
       transcript,
       handoffs,
@@ -290,8 +247,6 @@ export function useVoiceSession(
       status,
       errorMessage,
       persona,
-      panel,
-      activeSpeakerAgentId,
       sessionId,
       transcript,
       handoffs,
@@ -320,10 +275,6 @@ function percentile(samples: number[], p: number): number {
 /**
  * Coalesce partial transcript chunks into the latest row for the same role.
  * Final chunks always seal the row so subsequent partials open a new one.
- *
- * Panel mode wrinkle: when the speaker changes (e.g. Bull → Bear within one
- * panel reply), each utterance lands as its own final row even if a prior
- * partial exists. We treat a speaker change as a hard row break.
  */
 function mergeTranscript(
   prev: VoiceTranscriptEntry[],
@@ -337,14 +288,11 @@ function mergeTranscript(
         role: event.role,
         text: event.text,
         isPartial: !event.isFinal,
-        speakerAgentId: event.speakerAgentId,
       },
     ];
   }
   const last = prev[prev.length - 1];
-  const sameSpeaker =
-    last.role === event.role && last.speakerAgentId === event.speakerAgentId;
-  if (sameSpeaker && last.isPartial) {
+  if (last.role === event.role && last.isPartial) {
     const next = prev.slice(0, -1);
     next.push({ ...last, text: event.text, isPartial: !event.isFinal });
     return next;
@@ -356,7 +304,6 @@ function mergeTranscript(
       role: event.role,
       text: event.text,
       isPartial: !event.isFinal,
-      speakerAgentId: event.speakerAgentId,
     },
   ];
 }

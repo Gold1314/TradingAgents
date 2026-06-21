@@ -27,12 +27,6 @@ from typing import Optional, Tuple
 
 ENV_ENABLED = "TRADINGAGENTS_VOICE_ENABLED"
 
-# Separate gate for the multi-agent "panel" / group-call mode. Default OFF so
-# the single-agent voice path is unchanged when the feature first ships; flip
-# this when you're ready to expose the Group Call button. Single-agent voice
-# remains usable regardless of this flag.
-ENV_PANEL_ENABLED = "TRADINGAGENTS_VOICE_PANEL_ENABLED"
-
 ENV_LIVEKIT_URL = "LIVEKIT_URL"
 ENV_LIVEKIT_API_KEY = "LIVEKIT_API_KEY"
 ENV_LIVEKIT_API_SECRET = "LIVEKIT_API_SECRET"
@@ -99,24 +93,11 @@ def voice_enabled() -> bool:
     )
 
 
-def panel_enabled() -> bool:
-    """Whether the multi-agent panel/group-call mode is enabled.
-
-    Independent of single-agent voice — the router rejects ``agent_ids``
-    payloads with HTTP 400 when this is off, while ``agent_id`` (the
-    single-agent path) keeps working untouched. The capability probe at
-    ``GET /api/voice/config`` surfaces this so the client can hide the
-    Group Call button on builds where it's off.
-    """
-    return os.environ.get(ENV_PANEL_ENABLED, "").strip().lower() in _TRUTHY
-
-
 @dataclass(frozen=True)
 class VoiceSettings:
     """Resolved snapshot of the voice configuration. Cheap to construct."""
 
     enabled: bool
-    panel_enabled: bool
 
     livekit_url: Optional[str]
     livekit_api_key: Optional[str]
@@ -174,7 +155,6 @@ def load_settings() -> VoiceSettings:
     """Read the current voice settings from the environment."""
     return VoiceSettings(
         enabled=voice_enabled(),
-        panel_enabled=panel_enabled(),
         livekit_url=_env(ENV_LIVEKIT_URL),
         livekit_api_key=_env(ENV_LIVEKIT_API_KEY),
         livekit_api_secret=_env(ENV_LIVEKIT_API_SECRET),

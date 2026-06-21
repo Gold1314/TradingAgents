@@ -23,13 +23,12 @@ human-readable reason) — see :meth:`VoiceSettings.fully_configured`.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import ModuleType
-from typing import List, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
@@ -52,12 +51,6 @@ from web.voice.jwt import mint_room_token
 # dispatcher uses this string to route a newly created room to the right
 # worker pool when we pass ``RoomAgentDispatch(agent_name=...)``.
 VOICE_AGENT_NAME = "tradingagents-voice"
-
-# Hard cap on the number of personas one panel can host. Three is the design
-# limit (see voice_panel_groupchat plan): more would stack >3 sequential TTS
-# calls per turn and blow out the conversational rhythm. The router rejects
-# anything outside ``[1, _PANEL_MAX_SIZE]`` with HTTP 400.
-_PANEL_MAX_SIZE = 3
 
 logger = logging.getLogger("tradingagents.web.voice.router")
 
@@ -87,15 +80,8 @@ def _try_mobile_auth():
 
 
 class VoiceSessionRequest(BaseModel):
-    """Either ``agent_id`` (single-agent, original contract) OR ``agent_ids``
-    (panel / group call, 1-3 personas). Both can be sent — when both appear
-    ``agent_ids`` wins; ``agent_id`` is the v1 backward-compat path that
-    older clients still rely on.
-    """
-
     run_id: str
-    agent_id: Optional[str] = None
-    agent_ids: Optional[List[str]] = None
+    agent_id: str
 
 
 class ReconcileRequest(BaseModel):
@@ -225,110 +211,6 @@ def _persona_payload(p: VoicePersona) -> dict:
     }
 
 
-def _resolve_agent_ids(
-    body: "VoiceSessionRequest", settings: VoiceSettings
-) -> List[str]:
-    """Normalise a request into a deduplicated list of agent ids.
-
-    Rules:
-    * If ``agent_ids`` is set, that wins — but the panel feature flag must be
-      on AND len must be in ``[1, _PANEL_MAX_SIZE]`` (a one-element panel is
-      semantically the same as a single-agent call and is accepted).
-    * Else if ``agent_id`` is set, return ``[agent_id]`` (legacy v1 path).
-    * Else raise HTTP 400 — neither field was supplied.
-
-    Duplicates are rejected with HTTP 400 — having "Bull, Bull" on a panel
-    doesn't make sense and almost always indicates a UI bug.
-    """
-    ids: List[str]
-    if body.agent_ids is not None:
-        ids = [str(a).strip() for a in body.agent_ids if isinstance(a, str)]
-        ids = [a for a in ids if a]
-        if not ids:
-            raise HTTPException(
-                status_code=400,
-                detail="agent_ids must contain at least one non-empty agent id",
-            )
-        # Single-agent calls via ``agent_ids: [...]`` are allowed even when the
-        # panel flag is off — they're identical to the legacy single-agent
-        # path. Only block when len > 1 (the actual "panel" case).
-        if len(ids) > 1 and not settings.panel_enabled:
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "voice panel mode is disabled "
-                    "(TRADINGAGENTS_VOICE_PANEL_ENABLED is off)"
-                ),
-            )
-        if len(ids) > _PANEL_MAX_SIZE:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"voice panel supports at most {_PANEL_MAX_SIZE} agents; "
-                    f"got {len(ids)}"
-                ),
-            )
-        if len(set(ids)) != len(ids):
-            raise HTTPException(
-                status_code=400,
-                detail="agent_ids must not contain duplicates",
-            )
-        return ids
-    if body.agent_id:
-        agent_id = body.agent_id.strip()
-        if not agent_id:
-            raise HTTPException(status_code=400, detail="agent_id is required")
-        return [agent_id]
-    raise HTTPException(
-        status_code=400,
-        detail="either agent_id or agent_ids is required",
-    )
-
-
-def _resolve_personas(
-    agent_ids: List[str], user_id: Optional[str]
-) -> List[tuple]:
-    """Resolve each agent id to its persona snapshot + A/B variant.
-
-    Raises HTTP 400 the first time an id doesn't resolve, so the client gets
-    a precise "unknown agent_id: X" error rather than the whole call failing
-    with a generic 500.
-
-    Returns a list of ``(VoicePersona, variant_str)`` tuples in the same
-    order as ``agent_ids`` (so the worker can spell out the panel roster in
-    the orchestrator prompt deterministically).
-    """
-    out: List[tuple] = []
-    for aid in agent_ids:
-        assignment = get_persona_for_user(aid, user_id)
-        if assignment is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"unknown agent_id: {aid}",
-            )
-        out.append(assignment)
-    return out
-
-
-def _build_room_name(
-    run_id: str, agent_ids: List[str], session_id: str, is_panel: bool
-) -> str:
-    """Compose the LiveKit room name.
-
-    Single-agent rooms keep the original ``voice-{run}-{slug}-{sid8}`` shape
-    so existing dashboards and SQL queries don't have to learn a new format.
-    Panel rooms get a stable short hash over the sorted agent id list so
-    re-joining the same panel resolves to the same room name.
-    """
-    if not is_panel:
-        slug = agent_ids[0].lower().replace(" ", "-")
-        return f"voice-{run_id}-{slug}-{session_id[:8]}"
-    panel_hash = hashlib.sha256(
-        ",".join(sorted(agent_ids)).encode("utf-8")
-    ).hexdigest()[:8]
-    return f"voice-{run_id}-panel-{panel_hash}-{session_id[:8]}"
-
-
 def _run_completed(ctx: Optional[RunContext], agent_id: str) -> Optional[str]:
     """Return ``None`` if the run is ready for this agent, else an error string."""
     if ctx is None:
@@ -353,14 +235,7 @@ def build_voice_router(server: ModuleType) -> APIRouter:
 
     @router.get("/config")
     def voice_config() -> dict:
-        """Public capability probe — drives the "Talk" button visibility.
-
-        ``panel_enabled`` + ``panel_max_size`` are also surfaced here so the
-        client knows whether to show the Group Call button and how many
-        personas the picker is allowed to select. The panel flag is
-        independent of ``enabled``: a deployment can keep single-agent voice
-        on while the panel rollout is still off.
-        """
+        """Public capability probe — drives the "Talk" button visibility."""
         s = load_settings()
         ok, reason = s.fully_configured
         return {
@@ -371,8 +246,6 @@ def build_voice_router(server: ModuleType) -> APIRouter:
             "session_max_seconds": s.session_max_seconds,
             "daily_minutes_per_user": s.daily_minutes_per_user,
             "personas_count": len(voice_personas.PERSONAS),
-            "panel_enabled": s.panel_enabled,
-            "panel_max_size": _PANEL_MAX_SIZE,
         }
 
     @router.get("/personas")
@@ -391,19 +264,20 @@ def build_voice_router(server: ModuleType) -> APIRouter:
 
         user_id = _resolve_user_id(request, authorization)
         _assert_run_owner(server, body.run_id, user_id)
-
-        # Resolve the request into a list of personas. Single-agent
-        # (``agent_id``) and panel (``agent_ids``) modes share everything
-        # downstream of this point — capacity caps, run context, room
-        # provisioning, JWT minting — so we collapse them here.
-        agent_ids = _resolve_agent_ids(body, settings)
-        personas_with_variants = _resolve_personas(agent_ids, user_id)
-        is_panel = len(agent_ids) > 1
-        # The "primary" persona is the first one in the list. Its voice and
-        # variant get the legacy single-agent payload fields, so older
-        # clients reading those fields still see something sensible even
-        # when the session is actually a panel.
-        primary_persona, primary_variant = personas_with_variants[0]
+        # A/B routing: ``get_persona_for_user`` looks up
+        # ``TRADINGAGENTS_VOICE_VARIANT_{A,B}_<AGENT>`` env to pick the
+        # voice variant deterministically per user. Falls back to the base
+        # persona when no experiment is configured.
+        assignment = get_persona_for_user(body.agent_id, user_id)
+        if assignment is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown agent_id: {body.agent_id}",
+            )
+        persona, variant = assignment
+        # When mobile auth is enabled, the resolver raises 401 on missing
+        # bearer. For anonymous web visitors we accept None — we still gate
+        # minute caps by visitor_id when available.
 
         loop = asyncio.get_running_loop()
 
@@ -453,32 +327,28 @@ def build_voice_router(server: ModuleType) -> APIRouter:
         ctx = await loop.run_in_executor(
             None, lambda: load_run_context(body.run_id, server.manager)
         )
-        # Every selected agent must have produced a report on this run. For
-        # panels we check ALL members so we never join a call where one
-        # panelist is silent.
-        for aid in agent_ids:
-            err = _run_completed(ctx, aid)
-            if err is not None:
-                raise HTTPException(status_code=409, detail=err)
+        err = _run_completed(ctx, body.agent_id)
+        if err is not None:
+            raise HTTPException(status_code=409, detail=err)
 
         session_id = uuid.uuid4().hex
-        room = _build_room_name(body.run_id, agent_ids, session_id, is_panel)
+        # The room name encodes (run_id, agent_slug) so multiple users can
+        # talk to different agents on the same run without colliding, while
+        # one user re-joining the same agent ends up in the same room.
+        agent_slug = body.agent_id.lower().replace(" ", "-")
+        room = f"voice-{body.run_id}-{agent_slug}-{session_id[:8]}"
 
         # Room metadata — the worker reads this on JobContext.connect() to
-        # pick the persona(s) and load the run context. Keep it small (<8KB).
-        # ``agent_id`` is preserved for backward compat with the v1 worker
-        # path; ``agent_ids`` always carries the full panel list (single
-        # agent → list of length 1). The worker decides which path to take.
+        # pick the persona and load the run context. Keep it small (<8KB).
         metadata = {
             "session_id": session_id,
             "run_id": body.run_id,
-            "agent_id": agent_ids[0],
-            "agent_ids": agent_ids,
+            "agent_id": body.agent_id,
             "user_id": user_id,
             "ticker": ctx.ticker if ctx else None,
             "trade_date": ctx.trade_date if ctx else None,
             "asset_type": ctx.asset_type if ctx else None,
-            "variant": primary_variant,
+            "variant": variant,
         }
 
         # Pre-create the room so the LiveKit dispatcher binds our worker
@@ -519,38 +389,29 @@ def build_voice_router(server: ModuleType) -> APIRouter:
             lambda: voice_db.create_session(
                 session_id=session_id,
                 run_id=body.run_id,
-                agent_id=agent_ids[0],
+                agent_id=body.agent_id,
                 user_id=user_id,
                 livekit_room=room,
-                persona_voice_id=primary_persona.voice_id,
-                persona_voice_name=primary_persona.voice_name,
+                persona_voice_id=persona.voice_id,
+                persona_voice_name=persona.voice_name,
                 tts_provider=settings.tts_provider,
                 asr_provider="deepgram",
                 llm_provider=settings.voice_llm_provider,
                 llm_model=settings.voice_llm_model,
-                variant=primary_variant,
-                agent_ids=agent_ids if is_panel else None,
+                variant=variant,
             ),
         )
 
-        response: dict = {
+        return {
             "session_id": session_id,
             "url": settings.livekit_url,
             "token": token,
             "room": room,
-            "persona": _persona_payload(primary_persona),
-            "variant": primary_variant,
+            "persona": _persona_payload(persona),
+            "variant": variant,
             "expires_in": settings.token_ttl_seconds,
             "session_max_seconds": settings.session_max_seconds,
         }
-        if is_panel:
-            response["panel"] = {
-                "agent_ids": agent_ids,
-                "personas": [
-                    _persona_payload(p) for p, _ in personas_with_variants
-                ],
-            }
-        return response
 
     @router.get("/sessions/{session_id}")
     async def get_session(

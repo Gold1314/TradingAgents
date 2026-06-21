@@ -25,8 +25,6 @@ export function AgentCard({
   chartError,
   canTalk = false,
   onTalkRequested,
-  canGroupCall = false,
-  onGroupCallRequested,
 }: {
   card: AgentCardState;
   usage?: Usage;
@@ -39,20 +37,12 @@ export function AgentCard({
    */
   canTalk?: boolean;
   onTalkRequested?: (agent: string) => void;
-  /**
-   * Show a "Group call" button alongside Talk, gated by `panel_enabled` on
-   * the same capability probe. Tapping opens the panel picker with this
-   * agent pre-checked.
-   */
-  canGroupCall?: boolean;
-  onGroupCallRequested?: (agent: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const meta = agentMetadata(card.node);
   const isChartHost = card.node === CHART_HOST_NODE;
   const isDone = card.status === 'done';
   const showTalk = canTalk && isDone && onTalkRequested != null;
-  const showGroupCall = canGroupCall && isDone && onGroupCallRequested != null;
 
   return (
     <View
@@ -96,37 +86,17 @@ export function AgentCard({
         />
       </TouchTarget>
 
-      {(showTalk || showGroupCall) && (
-        <View style={styles.voiceActions}>
-          {showTalk && (
-            <TouchTarget
-              onPress={() => onTalkRequested?.(card.node)}
-              feedback="scale"
-              style={[
-                styles.talkButton,
-                { borderColor: withAlpha(meta.color, 0.6) },
-              ]}
-              accessibilityLabel={`Talk to ${meta.name}`}
-            >
-              <Text style={[styles.talkButtonText, { color: meta.color }]}>
-                🎙  Talk to {meta.name}
-              </Text>
-            </TouchTarget>
-          )}
-          {showGroupCall && (
-            <TouchTarget
-              onPress={() => onGroupCallRequested?.(card.node)}
-              feedback="scale"
-              style={[
-                styles.groupCallButton,
-                { borderColor: withAlpha(colors.accent, 0.5) },
-              ]}
-              accessibilityLabel={`Start a group call including ${meta.name}`}
-            >
-              <Text style={styles.groupCallText}>👥  Group call</Text>
-            </TouchTarget>
-          )}
-        </View>
+      {showTalk && (
+        <TouchTarget
+          onPress={() => onTalkRequested?.(card.node)}
+          feedback="scale"
+          style={[styles.talkButton, { borderColor: withAlpha(meta.color, 0.6) }]}
+          accessibilityLabel={`Talk to ${meta.name}`}
+        >
+          <Text style={[styles.talkButtonText, { color: meta.color }]}>
+            🎙  Talk to {meta.name}
+          </Text>
+        </TouchTarget>
       )}
 
       {expanded && (
@@ -253,13 +223,8 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     letterSpacing: 0.4,
   },
-  voiceActions: {
-    flexDirection: 'row',
-    gap: spacing.sm,
-    marginTop: spacing.md,
-  },
   talkButton: {
-    flex: 1,
+    marginTop: spacing.md,
     paddingVertical: spacing.sm,
     paddingHorizontal: spacing.md,
     borderRadius: radius.md,
@@ -268,20 +233,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   talkButtonText: {
-    fontSize: fontSize.sm,
-    fontWeight: '700',
-  },
-  groupCallButton: {
-    flex: 1,
-    paddingVertical: spacing.sm,
-    paddingHorizontal: spacing.md,
-    borderRadius: radius.md,
-    borderWidth: 1,
-    backgroundColor: withAlpha(colors.accent, 0.12),
-    alignItems: 'center',
-  },
-  groupCallText: {
-    color: colors.accent,
     fontSize: fontSize.sm,
     fontWeight: '700',
   },

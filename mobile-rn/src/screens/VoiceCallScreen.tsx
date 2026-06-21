@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -10,16 +10,8 @@ import {
 } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import type { RootStackParamList } from '../navigation/RootNavigator';
-import {
-  useVoiceSession,
-  type VoicePhase,
-  type VoiceSessionTarget,
-} from '../hooks/useVoiceSession';
-import type {
-  VoicePersonaPayload,
-  VoiceTranscriptEntry,
-  VoiceHandoff,
-} from '../models/voice';
+import { useVoiceSession, type VoicePhase } from '../hooks/useVoiceSession';
+import type { VoiceTranscriptEntry, VoiceHandoff } from '../models/voice';
 import { agentMetadata } from '../models/agentNode';
 import { Card, PulseDot, StatusDot, TouchTarget, Banner } from '../components/primitives';
 import { MarkdownBody } from '../components/MarkdownBody';
@@ -41,40 +33,23 @@ type Props = NativeStackScreenProps<RootStackParamList, 'VoiceCall'>;
  *   objection as new context (no full pipeline rerun).
  */
 export function VoiceCallScreen({ route, navigation }: Props) {
-  const { runId } = route.params;
-  // Discriminate the route shape into the hook's union. We prefer
-  // ``agentIds`` when set so the panel path wins on any ambiguous payload
-  // (this shouldn't ever fire in practice but guards against typos).
-  const target: VoiceSessionTarget = useMemo(() => {
-    if ('agentIds' in route.params && route.params.agentIds) {
-      return { mode: 'panel', agentIds: route.params.agentIds };
-    }
-    return { mode: 'single', agentId: route.params.agentId };
-  }, [route.params]);
-  const targetKey = target.mode === 'panel' ? target.agentIds.join(',') : target.agentId;
-  const session = useVoiceSession(runId, target);
-  const isPanel = target.mode === 'panel';
-  // Whose name + theme is in the header. Single-agent uses the persona;
-  // panel uses the lead persona for the accent color but renders a roster
-  // of avatars instead of a single big name.
-  const headerName = session.persona?.displayName ?? (
-    target.mode === 'single' ? target.agentId : 'Group call'
-  );
-  const meta = agentMetadata(session.persona?.displayName ?? headerName);
+  const { runId, agentId } = route.params;
+  const session = useVoiceSession(runId, agentId);
+  const meta = agentMetadata(session.persona?.displayName ?? agentId);
 
   useEffect(() => {
     void session.start();
-    // start() is a stable closure for the run/target pair — re-running on
+    // start() is a stable closure for the run/agent pair — re-running on
     // identity change is the desired behaviour.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runId, targetKey]);
+  }, [runId, agentId]);
 
   useEffect(() => {
     navigation.setOptions({
-      title: isPanel ? 'Group call' : headerName,
+      title: session.persona?.displayName ?? meta.name,
       headerBackTitle: 'Back',
     });
-  }, [navigation, isPanel, headerName]);
+  }, [navigation, session.persona, meta.name]);
 
   const onHangup = async () => {
     await session.hangup();
@@ -98,39 +73,19 @@ export function VoiceCallScreen({ route, navigation }: Props) {
     );
   };
 
-  // Per the plan §8: the "ask the PM to reconcile" composer only renders when
-  // the Portfolio Manager is in this session. In single-agent mode that's
-  // when the lone agent IS the PM; in panel mode any panel that includes
-  // the PM unlocks reconcile.
-  const showReconcile = isPanel
-    ? target.agentIds.includes('Portfolio Manager')
-    : target.agentId === 'Portfolio Manager';
-
   return (
     <View style={styles.screen}>
       <ScrollView contentContainerStyle={styles.scroll}>
-        {isPanel && session.panel ? (
-          <PanelHeader
-            personas={session.panel.personas}
-            activeSpeakerAgentId={session.activeSpeakerAgentId}
-            status={session.status}
-            phase={session.phase}
-            muted={session.muted}
-            latencyMs={session.lastTurnLatencyMs}
-            p95Ms={session.p95TurnLatencyMs}
-          />
-        ) : (
-          <PersonaHeader
-            name={session.persona?.displayName ?? meta.name}
-            voiceName={session.persona?.voiceName ?? null}
-            accent={meta.color}
-            status={session.status}
-            phase={session.phase}
-            muted={session.muted}
-            latencyMs={session.lastTurnLatencyMs}
-            p95Ms={session.p95TurnLatencyMs}
-          />
-        )}
+        <PersonaHeader
+          name={session.persona?.displayName ?? meta.name}
+          voiceName={session.persona?.voiceName ?? null}
+          accent={meta.color}
+          status={session.status}
+          phase={session.phase}
+          muted={session.muted}
+          latencyMs={session.lastTurnLatencyMs}
+          p95Ms={session.p95TurnLatencyMs}
+        />
 
         {session.errorMessage && <Banner text={session.errorMessage} tone="danger" icon />}
 
@@ -158,7 +113,7 @@ export function VoiceCallScreen({ route, navigation }: Props) {
           <TranscriptList entries={session.transcript} />
         </View>
 
-        {showReconcile && (
+        {agentId === 'Portfolio Manager' && (
           <ReconcileCard
             prefill={session.reconcilePrefill}
             busy={session.reconcileBusy}
@@ -185,81 +140,6 @@ export function VoiceCallScreen({ route, navigation }: Props) {
         onMute={session.toggleMute}
         onHangup={onHangup}
       />
-    </View>
-  );
-}
-
-function PanelHeader({
-  personas,
-  activeSpeakerAgentId,
-  status,
-  phase,
-  muted,
-  latencyMs,
-  p95Ms,
-}: {
-  personas: VoicePersonaPayload[];
-  activeSpeakerAgentId: string | null;
-  status: string;
-  phase: VoicePhase;
-  muted: boolean;
-  latencyMs: number | null;
-  p95Ms: number | null;
-}) {
-  return (
-    <View style={[styles.header, { borderColor: withAlpha(colors.accent, 0.5) }]}>
-      <Text style={styles.panelHeaderTitle}>Group call</Text>
-      <View style={styles.panelAvatarRow}>
-        {personas.map((p) => {
-          const m = agentMetadata(p.displayName ?? p.agentId);
-          const isActive = activeSpeakerAgentId === p.agentId;
-          return (
-            <View key={p.agentId} style={styles.panelAvatarColumn}>
-              <View
-                style={[
-                  styles.panelAvatar,
-                  {
-                    borderColor: withAlpha(m.color, isActive ? 1 : 0.4),
-                    backgroundColor: withAlpha(m.color, isActive ? 0.32 : 0.14),
-                  },
-                ]}
-              >
-                <Text style={styles.panelAvatarIcon}>{m.icon}</Text>
-                {isActive && (
-                  <View style={[styles.panelAvatarPulse, { borderColor: m.color }]} />
-                )}
-              </View>
-              <Text
-                style={[
-                  styles.panelAvatarLabel,
-                  { color: isActive ? m.color : colors.textMuted },
-                ]}
-                numberOfLines={1}
-              >
-                {m.name}
-              </Text>
-              {p.voiceName && (
-                <Text style={styles.panelAvatarVoice} numberOfLines={1}>
-                  {p.voiceName}
-                </Text>
-              )}
-            </View>
-          );
-        })}
-      </View>
-      <View style={styles.headerStatusRow}>
-        {phase === 'live' ? (
-          <PulseDot color={muted ? colors.warning : colors.accent} />
-        ) : (
-          <StatusDot color={statusColor(phase)} />
-        )}
-        <Text style={styles.headerStatusText}>{statusText(phase, status, muted)}</Text>
-        {latencyMs != null && (
-          <Text style={styles.headerLatency}>
-            {`Δ ${latencyMs}ms${p95Ms != null ? ` · p95 ${p95Ms}` : ''}`}
-          </Text>
-        )}
-      </View>
     </View>
   );
 }
@@ -363,32 +243,13 @@ function TranscriptList({ entries }: { entries: VoiceTranscriptEntry[] }) {
 }
 
 function TranscriptRow({ entry }: { entry: VoiceTranscriptEntry }) {
-  let label: string;
-  let labelColor: string;
-  switch (entry.role) {
-    case 'user':
-      label = 'YOU';
-      labelColor = colors.accent;
-      break;
-    case 'reconcile':
-      label = 'PM RECONCILE';
-      labelColor = colors.warning;
-      break;
-    case 'assistant':
-      if (entry.speakerAgentId) {
-        const speakerMeta = agentMetadata(entry.speakerAgentId);
-        label = speakerMeta.name.toUpperCase();
-        labelColor = speakerMeta.color;
-      } else {
-        label = 'AGENT';
-        labelColor = colors.textMuted;
-      }
-      break;
-    default: {
-      const _exhaustive: never = entry.role;
-      return _exhaustive;
-    }
-  }
+  const label = entry.role === 'user' ? 'YOU' : entry.role === 'reconcile' ? 'PM RECONCILE' : 'AGENT';
+  const labelColor =
+    entry.role === 'user'
+      ? colors.accent
+      : entry.role === 'reconcile'
+        ? colors.warning
+        : colors.textMuted;
   if (entry.role === 'reconcile') {
     return (
       <View style={styles.transcriptRow}>
@@ -500,53 +361,6 @@ const styles = StyleSheet.create({
   },
   headerName: { fontSize: fontSize.xl, fontWeight: '700' },
   headerSub: { color: colors.textMuted, fontSize: fontSize.sm },
-  panelHeaderTitle: {
-    color: colors.textPrimary,
-    fontSize: fontSize.lg,
-    fontWeight: '700',
-    marginBottom: spacing.sm,
-  },
-  panelAvatarRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-around',
-    alignItems: 'flex-start',
-    gap: spacing.md,
-  },
-  panelAvatarColumn: {
-    alignItems: 'center',
-    gap: spacing.xs,
-    flex: 1,
-  },
-  panelAvatar: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
-    borderWidth: 2,
-    alignItems: 'center',
-    justifyContent: 'center',
-    overflow: 'hidden',
-  },
-  panelAvatarIcon: { fontSize: 26 },
-  panelAvatarPulse: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    borderRadius: 28,
-    borderWidth: 2,
-    opacity: 0.7,
-  },
-  panelAvatarLabel: {
-    fontSize: fontSize.xs,
-    fontWeight: '700',
-    textTransform: 'uppercase',
-    letterSpacing: 0.4,
-  },
-  panelAvatarVoice: {
-    color: colors.textMuted,
-    fontSize: fontSize.xs,
-  },
   headerStatusRow: {
     flexDirection: 'row',
     alignItems: 'center',

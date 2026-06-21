@@ -60,25 +60,19 @@ def create_session(
     llm_provider: Optional[str],
     llm_model: Optional[str],
     variant: Optional[str] = None,
-    agent_ids: Optional[List[str]] = None,
 ) -> bool:
     """Insert a ``voice_sessions`` row at session start. Idempotent on session_id.
 
     ``variant`` records the persona A/B bucket so cost/quality analyses can be
-    sliced by variant. ``agent_ids`` records the full panel roster for
-    multi-agent sessions; single-agent calls leave it ``None``.
-
-    Both columns are optional at the DB layer: deployments that haven't run
-    the matching migration yet keep working — Supabase rejects an insert
-    containing an unknown column with a ``42703`` error code (``PGRST204``
-    via the REST shim), so we retry once with those optional columns
-    stripped. This lets the migration roll out independently of the code
-    deploy without surprising anyone with broken sessions.
+    sliced by variant. The DB column is optional — older deployments without
+    the column simply ignore the field (Supabase upsert ignores unknown keys
+    when its row-validation is permissive; if your schema is strict, run the
+    migration in ``supabase/migrations/*_voice_variant.sql``).
     """
     client = _client()
     if client is None:
         return False
-    row: Dict[str, Any] = {
+    row = {
         "id": session_id,
         "run_id": run_id,
         "agent_id": agent_id,
@@ -95,25 +89,10 @@ def create_session(
     }
     if variant:
         row["variant"] = variant
-    if agent_ids:
-        row["agent_ids"] = list(agent_ids)
     try:
         client.table("voice_sessions").upsert(row, on_conflict="id").execute()
         return True
     except Exception as exc:  # noqa: BLE001 — fail-open
-        # Fail-open + one targeted retry: if the failure looks like an
-        # unknown-column error (the panel migration hasn't run yet), drop
-        # the optional columns and try again so the session still persists
-        # on legacy deployments.
-        if _looks_like_unknown_column(exc) and ("agent_ids" in row or "variant" in row):
-            row.pop("agent_ids", None)
-            row.pop("variant", None)
-            try:
-                client.table("voice_sessions").upsert(row, on_conflict="id").execute()
-                return True
-            except Exception as exc2:  # noqa: BLE001
-                logger.warning("voice create_session retry failed: %s", exc2)
-                return False
         logger.warning("voice create_session failed: %s", exc)
         return False
 
@@ -162,15 +141,8 @@ def append_turn(
     ended_at: Optional[datetime] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
-    speaker_agent_id: Optional[str] = None,
 ) -> bool:
-    """Insert one finalized ASR or TTS turn into ``voice_turns``.
-
-    ``speaker_agent_id`` labels assistant turns with the panelist who spoke
-    them (used by the in-call UI to render a per-line persona badge). Like
-    :func:`create_session` the column is optional — deployments without the
-    panel migration retry without the field so the row still lands.
-    """
+    """Insert one finalized ASR or TTS turn into ``voice_turns``."""
     client = _client()
     if client is None:
         return False
@@ -186,20 +158,10 @@ def append_turn(
         row["started_at"] = started_at.isoformat()
     if ended_at:
         row["ended_at"] = ended_at.isoformat()
-    if speaker_agent_id:
-        row["speaker_agent_id"] = speaker_agent_id
     try:
         client.table("voice_turns").insert(row).execute()
         return True
     except Exception as exc:  # noqa: BLE001
-        if _looks_like_unknown_column(exc) and "speaker_agent_id" in row:
-            row.pop("speaker_agent_id", None)
-            try:
-                client.table("voice_turns").insert(row).execute()
-                return True
-            except Exception as exc2:  # noqa: BLE001
-                logger.warning("voice append_turn retry failed: %s", exc2)
-                return False
         logger.warning("voice append_turn failed: %s", exc)
         return False
 
@@ -436,28 +398,3 @@ def cost_summary(*, hours: int = 24) -> Dict[str, Any]:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-# Supabase REST surfaces an unknown column as one of a small set of error
-# shapes depending on which middleware caught it. We match on a substring
-# union so the retry path triggers across PostgREST versions without
-# importing supabase exception types (which differ between supabase-py 1.x
-# and 2.x and would force a hard dep here).
-_UNKNOWN_COLUMN_NEEDLES = (
-    "column ",          # PostgreSQL: 'column "agent_ids" of relation ... does not exist'
-    "PGRST204",         # PostgREST: schema cache miss after a migration drift
-    "42703",            # SQLSTATE for undefined_column
-    "schema cache",     # PostgREST: column added but cache is stale
-)
-
-
-def _looks_like_unknown_column(exc: BaseException) -> bool:
-    """Heuristic: does this look like "you wrote to a column that doesn't exist"?
-
-    Used by :func:`create_session` and :func:`append_turn` to decide whether
-    a one-shot retry without the optional column has any chance of
-    succeeding. Conservative — false positives only cost us a wasted retry,
-    not data loss.
-    """
-    msg = str(exc).lower()
-    return any(needle.lower() in msg for needle in _UNKNOWN_COLUMN_NEEDLES)

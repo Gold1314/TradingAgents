@@ -50,7 +50,6 @@ interface RunSessionState {
   initRestore: (runId: string, request: RunRequest, nodes: string[]) => void;
   initCached: (run: CachedRun) => void;
   setPhase: (phase: RunPhase) => void;
-  markFinished: () => void;
   setFailed: (message: string) => void;
   applyEvent: (event: AgentEvent) => void;
   setChart: (chart: ChartPayload) => void;
@@ -168,7 +167,6 @@ export const useRunSession = create<RunSessionState>((set, get) => ({
   },
 
   setPhase: (phase) => set({ phase }),
-  markFinished: () => set({ phase: 'finished', statusMessage: 'Complete' }),
   setFailed: (message) => set({ phase: 'failed', errorMessage: message }),
 
   setChart: (chart) => set({ chart }),
@@ -260,7 +258,10 @@ export const useRunSession = create<RunSessionState>((set, get) => ({
         break;
 
       case 'done':
-        get().markFinished();
+        set((s) => ({
+          phase: 'finished',
+          statusMessage: s.statusMessage === '' ? 'complete' : s.statusMessage,
+        }));
         break;
 
       case 'unknown':

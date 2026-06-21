@@ -18,23 +18,9 @@ import { colors, fontSize, radius, spacing } from '../theme/theme';
 export function AgentFeed({
   voiceReady = false,
   onTalkRequested,
-  panelReady = false,
-  onGroupCallRequested,
 }: {
   voiceReady?: boolean;
   onTalkRequested?: (agent: string) => void;
-  /**
-   * Whether the multi-agent panel/group-call feature is enabled. Gated by
-   * `panel_enabled` on `GET /api/voice/config`. Independent of `voiceReady`
-   * — single-agent voice can be on while panel is still rolling out.
-   */
-  panelReady?: boolean;
-  /**
-   * Tapped from the per-card "Group call" affordance. The screen owner
-   * receives the tapped agent so the picker can open with that one
-   * pre-checked.
-   */
-  onGroupCallRequested?: (agent: string) => void;
 } = {}) {
   // `useShallow` is required because `selectOrderedAgents` returns a fresh
   // array per call (`.map().filter()`). Without it, Zustand v5's
@@ -66,8 +52,6 @@ export function AgentFeed({
           chartError={card.node === CHART_HOST_NODE ? chartError : undefined}
           canTalk={voiceReady}
           onTalkRequested={onTalkRequested}
-          canGroupCall={panelReady}
-          onGroupCallRequested={onGroupCallRequested}
         />
       ))}
     </View>
