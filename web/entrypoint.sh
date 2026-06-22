@@ -56,7 +56,7 @@ case "$PROCESS" in
         run_as_appuser uvicorn web.server:app --host 0.0.0.0 --port "${PORT:-8000}"
         ;;
     voice-worker)
-        run_as_appuser python -m tradingagents.voice.agent_worker
+        run_as_appuser python web/voice_worker_boot.py
         ;;
     *)
         echo "[entrypoint] Unknown STOCKAGENTS_PROCESS=$PROCESS (expected web or voice-worker)" >&2
