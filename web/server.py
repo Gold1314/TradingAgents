@@ -36,7 +36,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -131,6 +131,10 @@ class RunRequest(BaseModel):
 
 class CacheToggle(BaseModel):
     enabled: bool
+
+
+class AdminLogin(BaseModel):
+    password: str
 
 
 class PlaceOrderRequest(BaseModel):
@@ -774,6 +778,83 @@ def _verify_blueprint_token(token: str, secret: str) -> Optional[str]:
         return None
 
 
+# ── admin session cookie (replaces client-held password) ──────────────────────
+# The browser must never persist the raw admin password (it previously lived in
+# localStorage, readable by any XSS). Instead, a successful password check mints
+# a short-lived, signed session token delivered as an HttpOnly cookie: JS can't
+# read it, and it's signed with the admin password itself, so rotating the
+# password invalidates every outstanding session.
+ADMIN_SESSION_COOKIE = "sa_admin_session"
+ADMIN_SESSION_TTL = 12 * 3600  # 12 hours
+
+
+def _mint_admin_session(ttl: int = ADMIN_SESSION_TTL) -> Optional[str]:
+    """Sign an admin session token, or None when no admin password is set."""
+    if not ADMIN_PASSWORD:
+        return None
+    exp = int(time.time()) + ttl
+    msg = f"admin|{exp}"
+    sig = hmac.new(ADMIN_PASSWORD.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{msg}|{sig}".encode()).decode()
+
+
+def _verify_admin_session(token: Optional[str]) -> bool:
+    """True iff the token is a valid, unexpired admin session for the current password."""
+    if not token or not ADMIN_PASSWORD:
+        return False
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        label, exp, sig = raw.rsplit("|", 2)
+        if label != "admin":
+            return False
+        expected = hmac.new(ADMIN_PASSWORD.encode(), f"{label}|{exp}".encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return False
+        return int(exp) >= int(time.time())
+    except Exception:  # noqa: BLE001 — any malformed token is simply invalid
+        return False
+
+
+def _cookie_secure(request: Optional[Request]) -> bool:
+    """Whether to set the Secure flag — on for HTTPS (incl. behind a TLS proxy)."""
+    if request is None:
+        return False
+    if request.url.scheme == "https":
+        return True
+    proto = request.headers.get("x-forwarded-proto", "")
+    return proto.split(",")[0].strip().lower() == "https"
+
+
+def _set_admin_cookie(request: Request, response: Response, token: str) -> None:
+    response.set_cookie(
+        ADMIN_SESSION_COOKIE,
+        token,
+        max_age=ADMIN_SESSION_TTL,
+        httponly=True,
+        samesite="strict",
+        secure=_cookie_secure(request),
+        path="/",
+    )
+
+
+def _clear_admin_cookie(response: Response) -> None:
+    response.delete_cookie(ADMIN_SESSION_COOKIE, path="/")
+
+
+def _admin_authed(request: Optional[Request], password: Optional[str]) -> bool:
+    """True if the caller is the operator, via a valid session cookie OR the
+    legacy ``X-Admin-Password`` header (kept for CLI/programmatic callers).
+
+    Returns False when no admin password is configured, so a misconfiguration
+    can't accidentally grant everyone owner access."""
+    if not ADMIN_PASSWORD:
+        return False
+    if password and hmac.compare_digest(password, ADMIN_PASSWORD):
+        return True
+    cookie = request.cookies.get(ADMIN_SESSION_COOKIE) if request is not None else None
+    return _verify_admin_session(cookie)
+
+
 def _graph_payload(analysts: str, max_debate_rounds: int, max_risk_rounds: int, include_internal: bool) -> dict:
     selected = [a.strip() for a in analysts.split(",") if a.strip()]
     if not selected:
@@ -874,6 +955,7 @@ async def robinhood_status() -> dict:
 
 @app.post("/api/robinhood/connect")
 async def robinhood_connect(
+    request: Request,
     x_admin_password: Optional[str] = Header(default=None),
 ) -> dict:
     """Authorize the Robinhood MCP (opens a browser for OAuth on first use).
@@ -885,7 +967,7 @@ async def robinhood_connect(
     Blocking OAuth/handshake work runs in the thread pool so the event loop
     stays responsive. Returns the resulting status (never raises on auth
     failure — the error is reported in the payload)."""
-    _require_admin(x_admin_password)
+    _require_admin(request, x_admin_password)
     cfg = load_robinhood_config(DEFAULT_CONFIG)
     if not cfg.enabled:
         raise HTTPException(
@@ -923,6 +1005,7 @@ def _account_payload() -> dict:
 
 @app.get("/api/robinhood/account")
 async def robinhood_account(
+    request: Request,
     x_admin_password: Optional[str] = Header(default=None),
 ) -> dict:
     """Live account snapshot — buying power, portfolio value, positions.
@@ -931,7 +1014,7 @@ async def robinhood_account(
     admin password is configured). Read-only (never places an order). Returns
     ``{connected: false, ...}`` instead of raising when the broker isn't
     authorized yet. Blocking broker work runs in the thread pool."""
-    _require_admin(x_admin_password)
+    _require_admin(request, x_admin_password)
     cfg = load_robinhood_config(DEFAULT_CONFIG)
     if not cfg.enabled:
         raise HTTPException(
@@ -946,6 +1029,7 @@ async def robinhood_account(
 async def place_order(
     run_id: str,
     body: PlaceOrderRequest,
+    request: Request,
     x_admin_password: Optional[str] = Header(default=None),
 ) -> dict:
     """Place the order proposed by a finished run (manual mode, button click).
@@ -955,7 +1039,7 @@ async def place_order(
     to requiring the run to still exist with a pending order. Applies optional
     ticket edits, re-clamps server-side, honors dry_run, and is idempotent.
     Blocking broker work runs in the thread pool."""
-    _require_admin(x_admin_password)
+    _require_admin(request, x_admin_password)
     cfg = load_robinhood_config(DEFAULT_CONFIG)
     if not cfg.enabled or cfg.trade_mode == "off":
         raise HTTPException(status_code=409, detail="Robinhood execution is off.")
@@ -1203,16 +1287,14 @@ async def track_event(payload: Dict[str, Any], request: Request) -> dict:
     return {"ok": True}
 
 
-def _is_owner(password: Optional[str]) -> bool:
-    """Whether this request was made by the operator (admin-password unlocked).
+def _is_owner(request: Optional[Request], password: Optional[str]) -> bool:
+    """Whether this request was made by the operator (admin session or header).
 
     Used to exempt the operator from the per-user run quota. Returns False
     (treat as anonymous user) when no admin password is configured at all, so
     a misconfiguration can't accidentally grant everyone unlimited runs.
     """
-    if not ADMIN_PASSWORD:
-        return False
-    return bool(password) and hmac.compare_digest(password, ADMIN_PASSWORD)
+    return _admin_authed(request, password)
 
 
 def _quota_state(client_meta: Dict[str, Any], owner: bool) -> Dict[str, Any]:
@@ -1253,7 +1335,7 @@ async def get_quota(
     """
     loop = asyncio.get_running_loop()
     meta = _client_meta(request)
-    owner = _is_owner(x_admin_password)
+    owner = _is_owner(request, x_admin_password)
     state = await loop.run_in_executor(None, _quota_state, meta, owner)
     return state
 
@@ -1316,7 +1398,7 @@ async def start_run(
     # Owner (admin-password unlocked) is exempt. Everyone else is capped at
     # RUN_LIMIT_PER_USER in a rolling RUN_LIMIT_WINDOW_HOURS window. Failed
     # runs are refunded (db.count_quota_consumed subtracts run_failed).
-    owner = _is_owner(x_admin_password)
+    owner = _is_owner(request, x_admin_password)
     quota = await loop.run_in_executor(None, _quota_state, client_meta, owner)
     if not quota["allowed"]:
         # 429 with a structured detail the UI can render verbatim.
@@ -1379,18 +1461,16 @@ def get_chart(ticker: str, trade_date: str, asset_type: str = "stock", lookback:
         raise HTTPException(status_code=404, detail=f"no chart data: {exc}")
 
 
-def _require_admin(password: Optional[str]) -> None:
+def _require_admin(request: Optional[Request], password: Optional[str]) -> None:
     if not ADMIN_PASSWORD:
         raise HTTPException(status_code=503, detail="admin features are not configured")
-    # Constant-time compare to avoid leaking the password via timing. Fail
-    # closed when the caller sent nothing.
-    if not password or not hmac.compare_digest(password, ADMIN_PASSWORD):
+    # Accept a valid session cookie or the legacy header; both use constant-time
+    # compares under the hood. Fail closed when the caller presented neither.
+    if not _admin_authed(request, password):
         raise HTTPException(status_code=401, detail="invalid admin password")
 
 
-@app.get("/api/admin/settings")
-def admin_settings(x_admin_password: Optional[str] = Header(default=None)) -> dict:
-    _require_admin(x_admin_password)
+def _admin_settings_payload() -> dict:
     return {
         "cache_enabled": db.get_cache_enabled(),
         "supabase_configured": db.is_configured(),
@@ -1398,11 +1478,44 @@ def admin_settings(x_admin_password: Optional[str] = Header(default=None)) -> di
     }
 
 
+@app.post("/api/admin/login")
+def admin_login(
+    body: AdminLogin, request: Request, response: Response
+) -> dict:
+    """Exchange the admin password for a short-lived HttpOnly session cookie.
+
+    The browser never stores the raw password again — the cookie is signed,
+    JS-unreadable, and expires. Returns the settings payload so the client can
+    populate the admin panel without a second round trip."""
+    _require_admin(request, body.password)
+    token = _mint_admin_session()
+    if token:
+        _set_admin_cookie(request, response, token)
+    return {"ok": True, **_admin_settings_payload()}
+
+
+@app.post("/api/admin/logout")
+def admin_logout(response: Response) -> dict:
+    """Drop the admin session cookie (best-effort; unauthenticated is fine)."""
+    _clear_admin_cookie(response)
+    return {"ok": True}
+
+
+@app.get("/api/admin/settings")
+def admin_settings(
+    request: Request, x_admin_password: Optional[str] = Header(default=None)
+) -> dict:
+    _require_admin(request, x_admin_password)
+    return _admin_settings_payload()
+
+
 @app.post("/api/admin/cache")
 def admin_set_cache(
-    body: CacheToggle, x_admin_password: Optional[str] = Header(default=None)
+    body: CacheToggle,
+    request: Request,
+    x_admin_password: Optional[str] = Header(default=None),
 ) -> dict:
-    _require_admin(x_admin_password)
+    _require_admin(request, x_admin_password)
     if not db.is_configured():
         raise HTTPException(status_code=503, detail="Supabase is not configured")
     ok = db.set_cache_enabled(body.enabled)

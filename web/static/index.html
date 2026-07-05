@@ -272,11 +272,12 @@
           <div class="text-sm font-medium text-slate-200">60-minute cache</div>
           <div class="text-xs text-slate-500">Serve a recent stored run for a ticker instead of re-running.</div>
         </div>
-        <button id="cache-switch" role="switch" class="relative w-12 h-6 rounded-full bg-slate-700 transition shrink-0">
+        <button id="cache-switch" role="switch" aria-checked="false" aria-label="60-minute cache" class="relative w-12 h-6 rounded-full bg-slate-700 transition shrink-0">
           <span class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-all"></span>
         </button>
       </div>
       <p id="admin-panel-msg" class="text-xs text-slate-500 mt-3"></p>
+      <button id="admin-logout" class="mt-4 text-xs text-slate-500 hover:text-slate-300 underline underline-offset-2 transition">Sign out of admin</button>
     </div>
   </div>
 </div>
@@ -553,7 +554,7 @@ async function loadAccount(open){
   $("account-summary").textContent="";
   $("account-body").innerHTML=`<span class="text-slate-500">Loading account…</span>`;
   try{
-    const res=await fetch("/api/robinhood/account",{headers:{...(adminPw?{"X-Admin-Password":adminPw}:{})}});
+    const res=await fetch("/api/robinhood/account");
     const a=await res.json();
     if(!res.ok || a.connected===false){
       $("account-body").innerHTML=`<span class="text-amber-300">${esc((a&&(a.detail||a.message))||"Robinhood not connected.")}</span>`;
@@ -622,7 +623,7 @@ async function connectRobinhood(){
   const btn=$("rh-btn"); const prev=btn.innerHTML;
   rhBadge(false,"Robinhood · authorizing…"); btn.disabled=true;
   try{
-    const res=await fetch("/api/robinhood/connect",{method:"POST",headers:{...(adminPw?{"X-Admin-Password":adminPw}:{})}});
+    const res=await fetch("/api/robinhood/connect",{method:"POST"});
     const st=await res.json();
     if(!res.ok){ rhBadge(false,"Robinhood · failed"); alert((st&&st.detail)||"Connect failed"); }
     else{ rhConfig=st; Analytics.track("robinhood_connect",{connected:!!st.connected}); if(st.connected){ rhBadge(true, rhBadgeLabel(st)); } else { rhBadge(false,"Robinhood · connect"); if(st.error) alert(st.error); } }
@@ -722,7 +723,7 @@ async function placeProposedOrder(ev){
   const place=host.querySelector("#ord-place"), stat=host.querySelector("#ord-status");
   if(place) place.disabled=true; if(stat) stat.textContent="placing…";
   try{
-    const res=await fetch(`/api/robinhood/orders/${activeRunId}`,{method:"POST",headers:{"Content-Type":"application/json",...(adminPw?{"X-Admin-Password":adminPw}:{})},body:JSON.stringify(edits)});
+    const res=await fetch(`/api/robinhood/orders/${activeRunId}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(edits)});
     const data=await res.json();
     if(!res.ok){ showTrade({status:"error",message:(data.detail||"placement failed"),intent:ev.intent,can_place_real_orders:ev.can_place_real_orders,dry_run:ev.dry_run}); }
     else { showTrade(data); }
@@ -1150,7 +1151,7 @@ async function startRun(force){
   $("run-form").classList.add("hidden"); $("run-summary").classList.remove("hidden");
 
   let res;
-  try{ res=await fetch("/api/runs",{method:"POST",headers:{"Content-Type":"application/json",...Analytics.headers(),...(adminPw?{"X-Admin-Password":adminPw}:{})},body:JSON.stringify(body)}); }
+  try{ res=await fetch("/api/runs",{method:"POST",headers:{"Content-Type":"application/json",...Analytics.headers()},body:JSON.stringify(body)}); }
   catch{ showError("Could not reach the server. Is it running?"); $("run-btn").disabled=false; $("new-run").disabled=false; statusPill("error","#f43f5e"); return; }
   if(res.status===429){
     const err=await res.json().catch(()=>({}));
@@ -1350,50 +1351,71 @@ async function downloadPDF(){
 $("download-pdf").onclick=downloadPDF;
 
 // ── admin panel ─────────────────────────────────────────────────────────────
-// Persisted across reloads so the owner stays exempt from the daily run quota
-// without re-unlocking every visit. Stored in localStorage on a deliberate
-// unlock action — no auto-prompt is shown to other users.
-let adminPw=localStorage.getItem("sa_admin_pw")||"";
+// The admin password is NEVER stored client-side. A successful unlock exchanges
+// it (once) for a short-lived, HttpOnly, signed session cookie via
+// /api/admin/login; the cookie rides along automatically on same-origin
+// requests, so no admin secret is ever readable by JS/XSS. `adminUnlocked` just
+// tracks whether we've confirmed the session this page load (for UI state).
+let adminUnlocked=false;
 function setSwitch(on){
   const sw=$("cache-switch"), knob=sw.firstElementChild;
   sw.dataset.on=on?"1":"0";
+  sw.setAttribute("aria-checked", on?"true":"false");
   sw.style.background=on?"#10b981":"#334155";
   knob.style.left=on?"auto":"0.125rem"; knob.style.right=on?"0.125rem":"auto";
 }
-$("admin-btn").onclick=()=>{
-  $("admin-modal").classList.remove("hidden");
+function showAdminPanel(s){
+  adminUnlocked=true;
+  $("admin-locked").classList.add("hidden"); $("admin-panel").classList.remove("hidden");
+  setSwitch(!!s.cache_enabled);
+  $("admin-panel-msg").textContent=s.supabase_configured?`Window: ${s.cache_window_minutes} minutes.`:"Supabase not configured — toggle has no effect yet.";
+  refreshQuota(); // owner is now exempt — re-render banner
+}
+function showAdminLocked(){
+  adminUnlocked=false;
   $("admin-locked").classList.remove("hidden"); $("admin-panel").classList.add("hidden");
-  $("admin-msg").textContent=""; $("admin-pw").value=""; $("admin-pw").focus();
+  $("admin-msg").textContent=""; $("admin-pw").value="";
+}
+$("admin-btn").onclick=async()=>{
+  $("admin-modal").classList.remove("hidden");
+  // If a valid session cookie already exists, skip the password prompt.
+  try{
+    const res=await fetch("/api/admin/settings");
+    if(res.ok){ showAdminPanel(await res.json()); return; }
+  }catch{}
+  showAdminLocked();
+  $("admin-pw").focus();
 };
 $("admin-close").onclick=()=>$("admin-modal").classList.add("hidden");
 $("admin-modal").onclick=(e)=>{ if(e.target===$("admin-modal")) $("admin-modal").classList.add("hidden"); };
 $("admin-unlock").onclick=async()=>{
   const pw=$("admin-pw").value;
-  const res=await fetch("/api/admin/settings",{headers:{"X-Admin-Password":pw}});
+  const res=await fetch("/api/admin/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});
   if(res.status===401){ $("admin-msg").textContent="Invalid admin password."; return; }
   if(res.status===503){ $("admin-msg").textContent="Admin features are not configured (set STOCKAGENTS_ADMIN_PASSWORD)."; return; }
-  if(!res.ok){ $("admin-msg").textContent="Could not load settings."; return; }
-  const s=await res.json();
-  adminPw=pw;
-  try{ localStorage.setItem("sa_admin_pw", pw); }catch{}
-  $("admin-locked").classList.add("hidden"); $("admin-panel").classList.remove("hidden");
-  setSwitch(!!s.cache_enabled);
-  $("admin-panel-msg").textContent=s.supabase_configured?`Window: ${s.cache_window_minutes} minutes.`:"Supabase not configured — toggle has no effect yet.";
-  refreshQuota(); // owner is now exempt — re-render banner
+  if(!res.ok){ $("admin-msg").textContent="Could not sign in."; return; }
+  showAdminPanel(await res.json());
+};
+$("admin-logout").onclick=async()=>{
+  try{ await fetch("/api/admin/logout",{method:"POST"}); }catch{}
+  showAdminLocked();
+  refreshQuota(); // no longer owner — re-render banner
 };
 $("cache-switch").onclick=async()=>{
   const next=$("cache-switch").dataset.on!=="1";
-  const res=await fetch("/api/admin/cache",{method:"POST",headers:{"Content-Type":"application/json","X-Admin-Password":adminPw},body:JSON.stringify({enabled:next})});
+  const res=await fetch("/api/admin/cache",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({enabled:next})});
   if(res.ok){ setSwitch(next); $("admin-panel-msg").textContent=`60-minute cache ${next?"enabled":"disabled"}.`; }
   else { const e=await res.json().catch(()=>({})); $("admin-panel-msg").textContent=e.detail||"Update failed."; }
 };
 
 // ── daily run quota banner ─────────────────────────────────────────────────
 // Authoritative count is server-side (Supabase events table); this is just the
-// UI hint so users know their state before clicking Run analysis.
+// UI hint so users know their state before clicking Run analysis. Owner
+// exemption is detected server-side from the admin session cookie (sent
+// automatically), so no admin secret travels in JS here.
 async function refreshQuota(){
   try{
-    const r=await fetch("/api/runs/quota",{headers:{...Analytics.headers(),...(adminPw?{"X-Admin-Password":adminPw}:{})}});
+    const r=await fetch("/api/runs/quota",{headers:{...Analytics.headers()}});
     if(!r.ok) return;
     renderQuota(await r.json());
   }catch{}
