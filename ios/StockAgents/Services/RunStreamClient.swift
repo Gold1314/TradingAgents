@@ -63,7 +63,20 @@ final class RunStreamClient {
                             runID: runID,
                             lastEventID: resumeID,
                             onEvent: { streamed in
-                                if let id = streamed.id { resumeID = id }
+                                // Genuine forward progress — a new, higher event
+                                // id — means this connection is healthy, so reset
+                                // the reconnect budget. Otherwise routine mid-run
+                                // drops (backgrounding, brief network blips)
+                                // accumulate over a long run and eventually exhaust
+                                // the cap even though the stream keeps recovering.
+                                // Reset ONLY on new ids, never on replayed ones, so
+                                // a server that keeps closing cleanly while
+                                // replaying the same events (no progress) still
+                                // trips the cap instead of looping forever.
+                                if let id = streamed.id {
+                                    if id > (resumeID ?? Int.min) { attempts = 0 }
+                                    resumeID = id
+                                }
                                 continuation.yield(streamed)
                             }
                         )

@@ -145,6 +145,27 @@ final class RunSessionViewModel: ObservableObject {
         streamTask = nil
     }
 
+    /// Re-sync after returning to the foreground. iOS suspends the socket while
+    /// backgrounded, so the SSE task can drop and — over a long run with several
+    /// backgroundings — exhaust its reconnect budget and land in `.failed` even
+    /// though the run is fine server-side. Only a `.failed` stream needs help
+    /// (an active one self-heals when the suspended backoff resumes, and a
+    /// `.finished`/`.idle` one is terminal): confirm the run still exists via
+    /// `GET /api/runs/{id}` and, if so, reconnect from the last event we saw
+    /// (resuming, not replaying). A `404` means the run expired — stay failed.
+    func resyncOnForeground() async {
+        guard let runID, case .failed = phase else { return }
+        do {
+            _ = try await api.runStatus(runID: runID)
+            connect(lastEventID: lastEventID)
+        } catch let error as APIError {
+            if case .http(let status, _) = error, status == 404 { return }
+            connect(lastEventID: lastEventID) // transient error — try to resume anyway
+        } catch {
+            connect(lastEventID: lastEventID)
+        }
+    }
+
     // MARK: - Streaming
 
     private func connect(lastEventID: Int?) {

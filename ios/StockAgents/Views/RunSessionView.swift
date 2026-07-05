@@ -8,6 +8,8 @@ struct RunSessionView: View {
     @ObservedObject var viewModel: RunSessionViewModel
     let onNewRun: () -> Void
 
+    @Environment(\.scenePhase) private var scenePhase
+
     @State private var showOrderTicket = false
     @State private var voiceReady = false
     @State private var voiceAgentID: String?
@@ -68,6 +70,14 @@ struct RunSessionView: View {
             voiceReady = (try? await env.api.fetchVoiceConfig().ready) ?? false
         }
         .onDisappear { viewModel.stop() }
+        .onChange(of: scenePhase) { newPhase in
+            // Returning to the foreground: the SSE socket may have been suspended
+            // and the stream dropped while backgrounded. Re-sync so a long run
+            // that hit its reconnect budget mid-background recovers.
+            if newPhase == .active {
+                Task { await viewModel.resyncOnForeground() }
+            }
+        }
         .sheet(isPresented: $showOrderTicket) {
             if let runID = viewModel.runID, let trade = viewModel.lastTrade {
                 OrderTicketView(
