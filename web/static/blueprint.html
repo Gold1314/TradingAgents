@@ -407,7 +407,16 @@ async function connectLive(runId) {
   if (liveES) liveES.close();
   liveES = new EventSource(`/api/runs/${runId}/events`);
   liveES.onmessage = (m) => { if (m.data) handleLiveEvent(JSON.parse(m.data)); };
-  liveES.onerror = () => { /* EventSource auto-retries; keep the banner up */ };
+  liveES.onerror = () => {
+    // CONNECTING: a transient drop — EventSource auto-retries, so keep the
+    // banner up and wait. CLOSED: fatal (run expired / 404) — surface it so a
+    // dead run doesn't sit here showing "Watching live run" forever.
+    if (liveES && liveES.readyState === EventSource.CLOSED) {
+      setLiveDetail("Live stream closed — the run may have ended or expired.");
+      const dot = document.getElementById("live-dot");
+      if (dot) { dot.classList.remove("live-dot"); dot.style.background = "#f43f5e"; }
+    }
+  };
   return true;
 }
 

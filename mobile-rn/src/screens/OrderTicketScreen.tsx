@@ -93,6 +93,15 @@ export function OrderTicketScreen({ route, navigation }: Props) {
   // get a sell-specific title and destructive button — they reduce a position
   // and warrant the extra cognitive friction; buy orders are additive.
   const promptConfirm = () => {
+    // Require an explicit positive size BEFORE opening the confirm dialog. Sending
+    // an empty size would let the server silently fall back to the agent's stashed
+    // size while the alert reads "$0.00" — so block with an inline error instead.
+    const amount = ticket.parsedAmount;
+    if (amount == null) {
+      warningFeedback();
+      ticket.reportInvalidSize();
+      return;
+    }
     // Haptic fires on the FIRST tap that opens the confirm Alert, not on the
     // alert's confirm button — that's the moment the user actually decides to
     // act. Sell mirrors the destructive styling with a warning pulse.
@@ -108,10 +117,8 @@ export function OrderTicketScreen({ route, navigation }: Props) {
         void _exhaustive;
       }
     }
-    const sizeText =
-      side === 'buy'
-        ? formatUsd(Number.parseFloat(notionalText) || 0)
-        : `${quantityText || '0'} shares`;
+    // Display EXACTLY what will be sent (the validated positive amount).
+    const sizeText = side === 'buy' ? formatUsd(amount) : `${amount} shares`;
     const header = `${side.toUpperCase()} ${proposed.ticker} · ${sizeText} · ${orderType}`;
     const liveMessage = usesBiometric
       ? `${header}\n\nThis is a LIVE order using real money. You'll confirm with ${biometryLabel(
@@ -315,6 +322,7 @@ function FailureSection({
       );
     case 'rateLimited':
     case 'validation':
+    case 'uncertain':
       return (
         <Card style={styles.section}>
           <Text style={[styles.failText, { color: colors.warning }]}>{failure.message}</Text>

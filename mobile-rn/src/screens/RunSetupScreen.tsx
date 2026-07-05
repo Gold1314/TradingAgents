@@ -11,6 +11,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import { useFocusEffect } from '@react-navigation/native';
 import DateTimePicker, {
   DateTimePickerAndroid,
   type DateTimePickerEvent,
@@ -27,7 +28,6 @@ import {
 } from '../models/run';
 import { ANALYST_DISPLAY_NAME, agentMetadata } from '../models/agentNode';
 import { activeRunStore, type ActiveRun } from '../state/activeRunStore';
-import { toTradeDate } from '../utils/format';
 import { lightFeedback, selectionFeedback } from '../utils/haptics';
 import { Banner, Card, TouchTarget } from '../components/primitives';
 import { Icon } from '../components/Icon';
@@ -87,7 +87,10 @@ export function RunSetupScreen({ navigation }: Props) {
   const insets = useSafeAreaInsets();
 
   const [ticker, setTicker] = useState('NVDA');
-  const [tradeDate, setTradeDate] = useState(toTradeDate(new Date()));
+  // Default to today's LOCAL calendar date using the same formatter the picker
+  // round-trips through, so the field and the picker agree regardless of UTC
+  // offset (a UTC default could show tomorrow's date late in the day).
+  const [tradeDate, setTradeDate] = useState(() => formatTradeDateLocal(new Date()));
   const [assetType, setAssetType] = useState<AssetType>('stock');
   const [selected, setSelected] = useState<string[]>(['market', 'social', 'news', 'fundamentals']);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -109,9 +112,19 @@ export function RunSetupScreen({ navigation }: Props) {
   const todayCeiling = new Date();
   const pickerValue = useMemo(() => parseTradeDateLocal(tradeDate), [tradeDate]);
 
-  useEffect(() => {
-    void activeRunStore.load().then(setResumable);
-  }, []);
+  // Reload the resume card whenever the screen regains focus (not just on mount),
+  // so a run that finished/failed while away doesn't leave a stale resume card.
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+      void activeRunStore.load().then((run) => {
+        if (active) setResumable(run);
+      });
+      return () => {
+        active = false;
+      };
+    }, []),
+  );
 
   // Apply server defaults for debate/risk rounds once config loads.
   useEffect(() => {

@@ -128,6 +128,11 @@
   // a single transcript history per page session.
   let panelEl = null;
 
+  // Teardown fn for the currently-live call, if any. Used to guarantee a call
+  // is fully hung up (room disconnected + mic stopped) before another starts,
+  // so a re-entrant start() can never leave two live rooms / two hot mics.
+  let _teardownActive = null;
+
   function buildPanel() {
     if (panelEl) return panelEl;
     panelEl = document.createElement("div");
@@ -289,6 +294,14 @@
     if (!runId || !agentId) throw new Error("runId and agentId are required");
     const cfg = await fetchConfig();
     if (!cfg.ready) throw new Error(cfg.reason || "voice is not configured");
+
+    // Guard against a re-entrant start (rapid Talk clicks / a handoff racing an
+    // in-flight start): fully tear down any existing call before opening a new
+    // one so we never end up with two live rooms holding the mic.
+    if (_teardownActive) {
+      try { await _teardownActive(); } catch { /* ignore */ }
+      _teardownActive = null;
+    }
 
     const u = ui();
     u.panel.classList.remove("hidden");
@@ -457,27 +470,43 @@
       if (!alive) {
         // Already torn down — just make sure the panel is hidden so the
         // user isn't stuck staring at a stale "Call ended" overlay.
+        if (_teardownActive === hangup) _teardownActive = null;
         u.panel.classList.add("hidden");
         return;
       }
       alive = false;
+      // Tear down every step independently and defensively: a throw from any one
+      // step (e.g. a rejected disconnect) must NOT skip the others, or the old
+      // room stays connected with the mic hot. Explicitly stop the local mic
+      // regardless of whether room.disconnect() succeeds.
+      try {
+        await room.localParticipant.setMicrophoneEnabled(false);
+      } catch { /* ignore */ }
+      try {
+        room.localParticipant.trackPublications.forEach((pub) => {
+          try { if (pub.track) pub.track.stop(); } catch { /* ignore */ }
+        });
+      } catch { /* ignore */ }
       try {
         await room.disconnect(true);
-      } finally {
-        cleanups.forEach((fn) => {
-          try {
-            fn();
-          } catch {
-            /* ignore */
-          }
-        });
-        setStatus("Call ended", "#94a3b8");
-        // Hide the panel on user-initiated hangup. The panel itself is
-        // reused across calls (singleton), so we only toggle visibility.
-        u.panel.classList.add("hidden");
-      }
+      } catch { /* ignore */ }
+      cleanups.forEach((fn) => {
+        try {
+          fn();
+        } catch {
+          /* ignore */
+        }
+      });
+      if (_teardownActive === hangup) _teardownActive = null;
+      setStatus("Call ended", "#94a3b8");
+      // Hide the panel on user-initiated hangup. The panel itself is
+      // reused across calls (singleton), so we only toggle visibility.
+      u.panel.classList.add("hidden");
     }
     u.hang.onclick = hangup;
+    // This call is now the live one; record its teardown for the re-entrancy
+    // guard at the top of start().
+    _teardownActive = hangup;
 
     // Reconcile button (Portfolio Manager only).
     if (agentId === "Portfolio Manager") {
@@ -499,7 +528,7 @@
           const result = await postReconcile(sess.session_id, txt);
           u.reconOut.style.color = "";
           const flipped = result.flipped
-            ? `<span style="color:#fbbf24"> (flipped to ${result.updated_decision})</span>`
+            ? `<span style="color:#fbbf24"> (flipped to ${escHtml(result.updated_decision)})</span>`
             : "";
           u.reconOut.innerHTML =
             `<div class="text-[10px] uppercase tracking-wide text-emerald-400 mb-1">Updated rationale${flipped}</div>` +
@@ -531,17 +560,33 @@
     };
   }
 
+  // Escape a plain string for safe interpolation into innerHTML.
+  function escHtml(s) {
+    const d = document.createElement("div");
+    d.textContent = s == null ? "" : String(s);
+    return d.innerHTML;
+  }
+
   function renderMarkdown(text) {
+    // The reconcile rationale is LLM-authored, so its HTML must be sanitized
+    // before it ever reaches innerHTML. DOMPurify is loaded by the host page
+    // (index.html). If it isn't present we refuse to trust marked's HTML and
+    // fall back to escaped plaintext rather than risk injecting a script.
+    const sanitize = (html) =>
+      window.DOMPurify && typeof window.DOMPurify.sanitize === "function"
+        ? window.DOMPurify.sanitize(html)
+        : null;
     if (window.marked && typeof window.marked.parse === "function") {
       try {
-        return window.marked.parse(text);
+        const clean = sanitize(window.marked.parse(text || ""));
+        if (clean != null) return clean;
       } catch {
         /* fall through */
       }
     }
     // Plaintext fallback — preserve newlines, escape HTML.
     const div = document.createElement("div");
-    div.textContent = text;
+    div.textContent = text || "";
     return div.innerHTML.replace(/\n/g, "<br>");
   }
 

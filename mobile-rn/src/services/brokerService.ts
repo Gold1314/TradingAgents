@@ -151,12 +151,16 @@ class BrokerService {
       return await this.send(method, path, body);
     } catch (error) {
       if (isUnauthorized(error)) {
-        const refreshed = await authService.attemptRefresh();
-        if (!refreshed) {
-          await authService.signOut();
-          throw error;
+        const outcome = await authService.attemptRefresh();
+        if (outcome.ok) {
+          return this.send(method, path, body);
         }
-        return this.send(method, path, body);
+        // Only a definitive rejection wipes the session; a transport failure
+        // during refresh keeps the tokens and surfaces the (retryable) 401.
+        if (outcome.reason === 'rejected') {
+          await authService.signOut();
+        }
+        throw error;
       }
       throw error;
     }

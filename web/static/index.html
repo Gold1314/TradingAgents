@@ -5,7 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>StockAgents — AI investment desk</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- Third-party libraries are pinned to exact, immutable versions. Subresource
+       Integrity (integrity="sha384-…" crossorigin="anonymous") should be added to
+       each of the CDN script tags below once valid hashes for these exact files
+       can be obtained (they could not be computed in the build environment). -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+  <!-- DOMPurify sanitizes all LLM/server-derived HTML before it reaches innerHTML. -->
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
   <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
@@ -318,9 +324,20 @@ if(window.marked && marked.use){
   marked.use({ tokenizer: { del(){ return undefined; } } });
 }
 
+// Single choke point for rendering LLM/server-authored markdown into the DOM.
+// marked.parse() turns markdown into HTML; DOMPurify strips any script/onclick/
+// javascript: payloads so a malicious agent report can't run in the page.
+// If DOMPurify somehow failed to load we return an empty string rather than
+// risk injecting unsanitized HTML.
+function safeHtml(md){
+  const html = (window.marked && marked.parse) ? marked.parse(md||"") : "";
+  return (window.DOMPurify && DOMPurify.sanitize) ? DOMPurify.sanitize(html) : "";
+}
+
 let plannedNodes = [], nodeEls = {}, cardEls = {}, sectionEls = {};
 let activeES = null, t0 = 0, timerInt = null, currentParams = null;
 let marketChartEl = null;  // chart container kept for PDF export
+let chartCleanups = [];    // teardown fns for ResizeObservers + chart instances
 let usageByNode = {}, usageTotals = null;  // run economics (tokens + est. cost)
 let activeRunId = null;  // current run id, mirrored into blueprint links for live watch
 const SESSION_KEY = "stockagents_active_run";
@@ -356,6 +373,9 @@ const Analytics = (() => {
   };
   return { visitorId: vid, sessionId: sid, headers, track };
 })();
+// Expose on window so the (separately loaded) voice client can attach the same
+// X-Visitor-Id/X-Session-Id headers for rate-limiting + analytics.
+window.Analytics = Analytics;
 
 // Acquisition: capture referrer + UTM params on first load of the session.
 (function trackPageView(){
@@ -533,10 +553,10 @@ async function loadAccount(open){
   $("account-summary").textContent="";
   $("account-body").innerHTML=`<span class="text-slate-500">Loading account…</span>`;
   try{
-    const res=await fetch("/api/robinhood/account");
+    const res=await fetch("/api/robinhood/account",{headers:{...(adminPw?{"X-Admin-Password":adminPw}:{})}});
     const a=await res.json();
     if(!res.ok || a.connected===false){
-      $("account-body").innerHTML=`<span class="text-amber-300">${(a&&(a.detail||a.message))||"Robinhood not connected."}</span>`;
+      $("account-body").innerHTML=`<span class="text-amber-300">${esc((a&&(a.detail||a.message))||"Robinhood not connected.")}</span>`;
       return;
     }
     Analytics.track("robinhood_account_view",{holdings:(a.holdings||[]).length});
@@ -562,7 +582,7 @@ function renderAccount(a){
   $("account-summary").innerHTML=summary;
   if(!holdings.length){ $("account-body").innerHTML=`<span class="text-slate-500">No open positions in any account.</span>`; return; }
   const rows=holdings.map((h)=>`<tr class="border-t border-slate-800">
-      <td class="py-1.5 pr-3 font-semibold text-slate-200">${h.symbol||"—"}${multiAcct?` <span class="text-[9px] text-slate-500">${h.account}${h.agentic?" · agentic":""}</span>`:""}</td>
+      <td class="py-1.5 pr-3 font-semibold text-slate-200">${esc(h.symbol||"—")}${multiAcct?` <span class="text-[9px] text-slate-500">${esc(h.account)}${h.agentic?" · agentic":""}</span>`:""}</td>
       <td class="py-1.5 pr-3 text-right tabular-nums">${h.quantity!=null?Number(h.quantity).toLocaleString(undefined,{maximumFractionDigits:6}):"—"}</td>
       <td class="py-1.5 pr-3 text-right tabular-nums text-slate-400">${h.average_buy_price!=null?fmtUsd(h.average_buy_price):"—"}</td>
       <td class="py-1.5 pr-3 text-right tabular-nums text-slate-400">${h.last_price!=null?fmtUsd(h.last_price):"—"}</td>
@@ -602,7 +622,7 @@ async function connectRobinhood(){
   const btn=$("rh-btn"); const prev=btn.innerHTML;
   rhBadge(false,"Robinhood · authorizing…"); btn.disabled=true;
   try{
-    const res=await fetch("/api/robinhood/connect",{method:"POST"});
+    const res=await fetch("/api/robinhood/connect",{method:"POST",headers:{...(adminPw?{"X-Admin-Password":adminPw}:{})}});
     const st=await res.json();
     if(!res.ok){ rhBadge(false,"Robinhood · failed"); alert((st&&st.detail)||"Connect failed"); }
     else{ rhConfig=st; Analytics.track("robinhood_connect",{connected:!!st.connected}); if(st.connected){ rhBadge(true, rhBadgeLabel(st)); } else { rhBadge(false,"Robinhood · connect"); if(st.error) alert(st.error); } }
@@ -615,7 +635,7 @@ function showAccount(ev){
   if(!ev.connected){
     panel.classList.remove("hidden"); panel.style.borderColor=tint("#fbbf24",.4);
     $("trade-mode").textContent="not connected"; $("trade-mode").style.color="#fbbf24"; $("trade-mode").style.borderColor=tint("#fbbf24",.5);
-    $("trade-account").textContent=""; $("trade-body").innerHTML=`<span class="text-amber-300">${ev.message||"Robinhood not connected."}</span>`;
+    $("trade-account").textContent=""; $("trade-body").innerHTML=`<span class="text-amber-300">${esc(ev.message||"Robinhood not connected.")}</span>`;
     return;
   }
   panel.classList.remove("hidden");
@@ -631,8 +651,8 @@ const TRADE_STYLE={
 let pendingProposal=null;
 function tradeBadge(text,color){ const m=$("trade-mode"); m.textContent=text; m.style.color=color; m.style.borderColor=tint(color,.5); }
 function intentLine(intent,color){
-  const size = intent.notional!=null ? fmtUsd(intent.notional) : `${intent.quantity} sh`;
-  return `<div class="text-base font-semibold" style="color:${color}">${intent.action.toUpperCase()} ${intent.ticker} · ${size} <span class="text-xs font-normal text-slate-400">(${intent.order_type})</span></div>`;
+  const size = intent.notional!=null ? fmtUsd(intent.notional) : `${esc(String(intent.quantity??""))} sh`;
+  return `<div class="text-base font-semibold" style="color:${color}">${esc(String(intent.action||"").toUpperCase())} ${esc(intent.ticker)} · ${size} <span class="text-xs font-normal text-slate-400">(${esc(intent.order_type)})</span></div>`;
 }
 function showTrade(ev){
   const panel=$("trade-panel"); panel.classList.remove("hidden");
@@ -644,9 +664,9 @@ function showTrade(ev){
   let html="";
   html += (intent && intent.action!=="none") ? intentLine(intent,st.c)
         : `<div class="text-base font-semibold" style="color:${st.c}">${st.t.toUpperCase()}</div>`;
-  if(ev.order_id) html += `<div class="text-xs text-slate-400 mt-1">Order ID: <span class="font-mono">${ev.order_id}</span></div>`;
-  if(ev.message) html += `<div class="text-xs text-slate-400 mt-1">${ev.message}</div>`;
-  if(intent && intent.reason && intent.reason!==ev.message) html += `<div class="text-[11px] text-slate-500 mt-1">${intent.reason}</div>`;
+  if(ev.order_id) html += `<div class="text-xs text-slate-400 mt-1">Order ID: <span class="font-mono">${esc(ev.order_id)}</span></div>`;
+  if(ev.message) html += `<div class="text-xs text-slate-400 mt-1">${esc(ev.message)}</div>`;
+  if(intent && intent.reason && intent.reason!==ev.message) html += `<div class="text-[11px] text-slate-500 mt-1">${esc(intent.reason)}</div>`;
   $("trade-body").innerHTML=html;
   // After a rehearsal (dry run) or a recoverable error, let them adjust and retry.
   if((ev.status==="dry_run"||ev.status==="error") && pendingProposal){ appendTicket(pendingProposal); }
@@ -657,7 +677,7 @@ function renderProposedTicket(ev){
   const panel=$("trade-panel"); panel.style.borderColor=tint("#eab308",.5);
   tradeBadge(ev.dry_run ? "rehearsal · dry run" : (ev.can_place_real_orders ? "LIVE · real money" : "ready to place"), ev.dry_run?"#38bdf8":(ev.can_place_real_orders?"#f59e0b":"#34d399"));
   $("trade-body").innerHTML = `<div class="text-base font-semibold text-amber-300 mb-1">Proposed order — review &amp; place</div>
-    <div class="text-[11px] text-slate-500 mb-3" id="ord-reason">${ev.intent.reason||""}</div>
+    <div class="text-[11px] text-slate-500 mb-3" id="ord-reason">${esc(ev.intent.reason||"")}</div>
     <div id="ord-ticket"></div>`;
   appendTicket(ev);
 }
@@ -702,7 +722,7 @@ async function placeProposedOrder(ev){
   const place=host.querySelector("#ord-place"), stat=host.querySelector("#ord-status");
   if(place) place.disabled=true; if(stat) stat.textContent="placing…";
   try{
-    const res=await fetch(`/api/robinhood/orders/${activeRunId}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(edits)});
+    const res=await fetch(`/api/robinhood/orders/${activeRunId}`,{method:"POST",headers:{"Content-Type":"application/json",...(adminPw?{"X-Admin-Password":adminPw}:{})},body:JSON.stringify(edits)});
     const data=await res.json();
     if(!res.ok){ showTrade({status:"error",message:(data.detail||"placement failed"),intent:ev.intent,can_place_real_orders:ev.can_place_real_orders,dry_run:ev.dry_run}); }
     else { showTrade(data); }
@@ -816,7 +836,7 @@ function updateCard(node,{status,content}){
   if(status==="running"){ badge.innerHTML=`<span class="w-1.5 h-1.5 rounded-full bg-amber-400 pulse-dot"></span>working`; badge.style.color="#fbbf24"; return; }
   if(status==="done"){
     badge.innerHTML=`✓ done`; badge.style.color="#34d399";
-    if(content&&content.trim()){ const html=marked.parse(content); body.innerHTML=html; prev.textContent=plainPreview(html); }
+    if(content&&content.trim()){ const html=safeHtml(content); body.innerHTML=html; prev.textContent=plainPreview(html); }
     else { body.innerHTML=`<span class="text-slate-500 italic">No textual output.</span>`; prev.textContent="—"; }
     if(node==="Market Analyst" && currentParams && !card.querySelector("[data-chart]")){
       const chart=document.createElement("div"); chart.setAttribute("data-chart","");
@@ -874,11 +894,14 @@ function loadChart(container, params){
 }
 function renderChart(container, d){
   if(!window.LightweightCharts){ container.innerHTML=`<div class="text-xs text-slate-500">Charting library failed to load.</div>`; return; }
+  // Tear down any prior chart/observer on this container before re-rendering.
+  if(container.__ro){ try{ container.__ro.disconnect(); }catch{} }
+  if(container.__charts){ container.__charts.forEach(c=>{ try{ c.remove(); }catch{} }); }
   container.innerHTML="";
   const LC=window.LightweightCharts, DASH=(LC.LineStyle&&LC.LineStyle.Dashed)||2;
   const legend=document.createElement("div");
   legend.className="flex flex-wrap gap-3 text-[10px] text-slate-400 mb-1";
-  legend.innerHTML=`<span class="font-semibold text-slate-300">${d.symbol}</span>
+  legend.innerHTML=`<span class="font-semibold text-slate-300">${esc(d.symbol)}</span>
     <span><span style="color:#38bdf8">━</span> SMA50</span>
     <span><span style="color:#a78bfa">━</span> SMA200</span>
     <span><span style="color:#64748b">┄</span> Bollinger</span>
@@ -918,7 +941,10 @@ function renderChart(container, d){
   charts.forEach(sync);
   const ro=new ResizeObserver(()=>{ const w=container.clientWidth||640; charts.forEach(c=>c.applyOptions({width:w})); });
   ro.observe(container);
-  container.__charts=charts; marketChartEl=container;  // expose for PDF export
+  container.__charts=charts; container.__ro=ro; marketChartEl=container;  // expose for PDF export
+  // Register a teardown so resetUI can disconnect the observer and dispose the
+  // lightweight-charts instances instead of leaking them when the DOM is wiped.
+  chartCleanups.push(()=>{ try{ ro.disconnect(); }catch{} charts.forEach(c=>{ try{ c.remove(); }catch{} }); });
 }
 
 // ── run economics (tokens & estimated cost) ─────────────────────────────────
@@ -993,7 +1019,7 @@ function showVerdict(decision,content){
   const mk=$("verdict-marker"); mk.classList.remove("hidden"); mk.style.left=(RATING_POS[decision]??50)+"%"; mk.style.background=RATING_COLOR[decision]||"#0f172a"; mk.style.borderColor="#fff";
   if(content&&content.trim()){
     const t=$("verdict-toggle"), r=$("verdict-rationale");
-    t.style.display="inline-flex"; t.classList.add("attention-pulse"); r.innerHTML=marked.parse(content); r.classList.add("hidden");
+    t.style.display="inline-flex"; t.classList.add("attention-pulse"); r.innerHTML=safeHtml(content); r.classList.add("hidden");
     const chev=t.querySelector("[data-chev]"), label=t.querySelector("[data-label]"), hint=t.querySelector("[data-hint]");
     chev.style.transform="rotate(0deg)"; label.textContent="Read the Portfolio Manager's full rationale"; if(hint) hint.style.display="";
     t.onclick=()=>{
@@ -1024,7 +1050,17 @@ function handleEvent(ev){
     case "final": showVerdict(ev.decision,ev.content); break;
     case "account": showAccount(ev); break;
     case "trade": showTrade(ev); refreshRobinhoodStatus(); break;
-    case "error": statusPill("error","#f43f5e"); showError(ev.message); refreshQuota(); break;
+    case "error":
+      statusPill("error","#f43f5e"); showError(ev.message);
+      // Tear the run UI down the same way "done" does — a server error event may
+      // be the last thing we receive (a trailing "done" can be dropped), so we
+      // must re-enable the controls and stop the timer here or the UI wedges.
+      clearActiveRun();
+      $("run-btn").dataset.finished="1";
+      stopTimer(); $("run-btn").disabled=false; $("new-run").disabled=false;
+      if(activeES) activeES.close();
+      refreshQuota();
+      break;
     case "done":
       plannedNodes.forEach((n)=>setNodeState(n,"done"));
       clearActiveRun();
@@ -1041,12 +1077,17 @@ function showError(msg){
 }
 
 function resetUI(){
+  // Dispose chart instances + ResizeObservers before wiping the stages DOM so
+  // they don't leak across runs (the observers would otherwise keep firing on
+  // detached nodes and the chart instances stay in memory).
+  chartCleanups.forEach(fn=>{ try{ fn(); }catch{} }); chartCleanups=[];
   $("stages").innerHTML=""; $("identity").classList.add("hidden"); $("identity").textContent="";
   $("verdict-rationale").classList.add("hidden"); $("verdict-toggle").style.display="none"; $("verdict-toggle").classList.remove("attention-pulse");
   $("cache-banner").classList.add("hidden"); $("cache-banner").style.display="none";
   cardEls={}; sectionEls={}; marketChartEl=null; $("empty").classList.add("hidden");
   $("download-pdf").classList.add("hidden");
   usageByNode={}; usageTotals=null; $("economics").classList.add("hidden");
+  pendingProposal=null;  // clear stale trade proposal so it can't leak into the next run
   $("trade-panel").classList.add("hidden"); $("trade-body").innerHTML=""; $("trade-account").textContent=""; $("trade-mode").textContent="";
 }
 

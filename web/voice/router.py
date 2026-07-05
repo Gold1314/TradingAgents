@@ -23,6 +23,7 @@ human-readable reason) — see :meth:`VoiceSettings.fully_configured`.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import uuid
@@ -96,7 +97,9 @@ def _require_admin(password: Optional[str]) -> None:
     pw = _admin_password()
     if not pw:
         raise HTTPException(status_code=503, detail="admin features are not configured")
-    if password != pw:
+    # Constant-time compare to avoid leaking the password via timing. Fail
+    # closed when the caller sent nothing.
+    if not password or not hmac.compare_digest(password, pw):
         raise HTTPException(status_code=401, detail="invalid admin password")
 
 
@@ -149,8 +152,11 @@ def _assert_run_owner(
        to Supabase, plus runs created in dev without a DB).
     2. Supabase ``runs`` table via :func:`voice_db.get_run_owner`.
 
-    Fail-open: if neither source can find the run, the request proceeds.
-    The owning user is only enforced when we can actually establish one.
+    A run with a *recorded* owner is enforced (mismatch -> 403). A run that is
+    genuinely ownerless (``owner is None`` — legacy web-flow runs) still passes
+    through, since the web voice flow is meant to work for those. But if the
+    ownership lookup itself *errors*, we fail CLOSED (deny) rather than treat
+    the error as "ownerless" and grant access.
     """
     if user_id is None:
         return
@@ -172,8 +178,11 @@ def _assert_run_owner(
             return
     try:
         owner = voice_db.get_run_owner(run_id)
-    except Exception:  # noqa: BLE001 — fail-open
-        owner = None
+    except Exception as exc:  # noqa: BLE001 — fail CLOSED on lookup error
+        logger.warning("run ownership lookup failed, denying: %s", exc)
+        raise HTTPException(
+            status_code=403, detail="run ownership could not be verified"
+        ) from exc
     if owner is not None and owner != user_id:
         raise HTTPException(status_code=403, detail="run does not belong to caller")
 

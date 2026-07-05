@@ -163,19 +163,35 @@ export async function* streamRun(opts: StreamOptions): AsyncGenerator<StreamedEv
     let reader: ReadableStreamDefaultReader<Uint8Array>;
     try {
       reader = await openConnection(opts, resumeId);
-      // Connected (past auth) → any prior token expiry is resolved.
+      // Connected (past auth) → any prior token expiry is resolved and the
+      // reconnect budget is replenished. Without this reset, cumulative drops
+      // over a long run (e.g. each app-backgrounding) would permanently exhaust
+      // `MAX_RECONNECT_ATTEMPTS` even though every connection succeeded.
       authRefreshAttempts = 0;
+      attempts = 0;
     } catch (error) {
       if (opts.signal.aborted) return;
       if (isUnauthorized(error)) {
         authRefreshAttempts += 1;
-        const refreshed =
-          authRefreshAttempts <= MAX_AUTH_REFRESH_ATTEMPTS && (await authService.attemptRefresh());
-        if (!refreshed) {
+        if (authRefreshAttempts > MAX_AUTH_REFRESH_ATTEMPTS) {
+          // Repeated 401s even after refreshing — the session is no longer valid.
           await authService.signOut();
           throw error;
         }
-        continue; // reconnect now, no backoff — the token is fresh
+        const outcome = await authService.attemptRefresh();
+        if (outcome.ok) {
+          continue; // reconnect now, no backoff — the token is fresh
+        }
+        if (outcome.reason === 'rejected') {
+          await authService.signOut();
+          throw error;
+        }
+        // Transport failure during refresh: the refresh token may still be good,
+        // so back off and retry the connection instead of destroying the session.
+        attempts += 1;
+        if (attempts >= MAX_RECONNECT_ATTEMPTS) throw error;
+        await sleep(Math.min(attempts, 3) * 1000);
+        continue;
       }
       attempts += 1;
       if (attempts >= MAX_RECONNECT_ATTEMPTS) throw error;

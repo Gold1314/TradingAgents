@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { brokerService } from '../services/brokerService';
 import {
   biometrics,
+  BiometricGateError,
   isBiometricGateError,
   type BiometryKind,
 } from '../services/biometrics';
@@ -34,7 +35,8 @@ export type SubmissionFailure =
   | { kind: 'brokerNotConnected'; message: string } // 409 "not connected"
   | { kind: 'runUnavailable'; message: string } // 404
   | { kind: 'rateLimited'; message: string; retryAfter: number | null } // 429
-  | { kind: 'validation'; message: string } // 400
+  | { kind: 'validation'; message: string } // 400 / client-side size check
+  | { kind: 'uncertain'; message: string } // timeout/transport — order may still have executed
   | { kind: 'generic'; message: string };
 
 export type OrderPhase =
@@ -71,6 +73,14 @@ export interface OrderTicket {
   biometryKind: BiometryKind;
   isSubmitting: boolean;
   isPlaced: boolean;
+  /**
+   * The positive size for the active side (notional for buy, quantity for sell),
+   * or null when the field is empty / non-numeric / non-positive. This is the
+   * exact amount that will be sent — the confirm dialog must display it.
+   */
+  parsedAmount: number | null;
+  /** Surface an inline "enter a valid amount" error; blocks the confirm dialog. */
+  reportInvalidSize: () => void;
   /** THE submission gate. Call only from the deliberate confirm action. */
   confirmAndSubmit: () => Promise<void>;
 }
@@ -114,39 +124,66 @@ export function useOrderTicket(runId: string, trade: TradeEvent): OrderTicket {
     })();
   }, []);
 
+  // The exact positive size that will be sent. Empty / non-numeric / non-positive
+  // resolves to null so the caller can block submission (mirrors the server's 400)
+  // rather than sending `undefined` and letting the server silently fall back to
+  // the stashed pending-order size while the UI shows "$0.00".
+  const parsedAmount = useMemo<number | null>(() => {
+    const text = side === 'buy' ? notionalText : quantityText;
+    const value = Number.parseFloat(text.trim());
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }, [side, notionalText, quantityText]);
+
   /** Build the edit payload — ticker is never sent (server forces the run's). */
   const makeEdits = useCallback((): PlaceOrderRequest => {
     const edits: PlaceOrderRequest = {
       action: side,
       orderType: orderType.trim().toLowerCase(),
     };
+    // `parsedAmount` is guaranteed positive by `confirmAndSubmit`'s gate; carry it
+    // through verbatim so what the server executes matches what the user confirmed.
     if (side === 'buy') {
-      const notional = Number.parseFloat(notionalText.trim());
-      edits.notional = Number.isFinite(notional) ? notional : undefined;
+      edits.notional = parsedAmount ?? undefined;
       edits.quantity = undefined;
     } else {
-      const quantity = Number.parseFloat(quantityText.trim());
-      edits.quantity = Number.isFinite(quantity) ? quantity : undefined;
+      edits.quantity = parsedAmount ?? undefined;
       edits.notional = undefined;
     }
     return edits;
-  }, [side, orderType, notionalText, quantityText]);
+  }, [side, orderType, parsedAmount]);
+
+  /** Show an inline validation error and keep the confirm dialog closed. */
+  const reportInvalidSize = useCallback(() => {
+    setPhase({
+      kind: 'failed',
+      failure: { kind: 'validation', message: 'Enter a valid amount greater than 0.' },
+    });
+  }, []);
 
   const confirmAndSubmit = useCallback(async () => {
     try {
+      // Defensive re-check: the network call must never proceed without a positive
+      // size (the confirm dialog already blocked this, but the gate stays here too).
+      if (parsedAmount == null) {
+        reportInvalidSize();
+        return;
+      }
       if (placesRealMoney) {
-        // Optional biometric second factor: re-check availability authoritatively
-        // and only run `evaluate` when an enrolled biometric exists. When present
-        // a failed/cancelled evaluation throws and the network call never runs;
-        // when absent we proceed straight to submit (the explicit confirm Alert,
-        // already passed by the caller, is the required gate).
+        // Mandatory OS authentication for a real-money order (biometrics.ts
+        // contract: the gate is NEVER skipped for a LIVE order). `evaluate` falls
+        // back to the device passcode when no biometric is enrolled, so we run it
+        // whenever ANY device authentication is available. Only a device offering
+        // NO authentication at all ('none') can't be gated — there we block the
+        // LIVE order rather than silently proceeding.
         const kind = await biometrics.availableKind();
-        if (kind === 'faceID' || kind === 'touchID') {
-          setPhase({ kind: 'authenticating' });
-          await biometrics.evaluate(
-            `Authorize your LIVE ${side} order for ${proposed.ticker}.`,
+        if (kind === 'none') {
+          throw new BiometricGateError(
+            'unavailable',
+            'Device authentication is required for live orders. Set up Face ID / Touch ID or a device passcode in Settings, then try again.',
           );
         }
+        setPhase({ kind: 'authenticating' });
+        await biometrics.evaluate(`Authorize your LIVE ${side} order for ${proposed.ticker}.`);
       }
       setPhase({ kind: 'submitting' });
       const result = await brokerService.submitOrder(runId, makeEdits());
@@ -154,7 +191,7 @@ export function useOrderTicket(runId: string, trade: TradeEvent): OrderTicket {
     } catch (error) {
       if (mounted.current) setPhase({ kind: 'failed', failure: classifyFailure(error) });
     }
-  }, [placesRealMoney, side, proposed.ticker, runId, makeEdits]);
+  }, [parsedAmount, reportInvalidSize, placesRealMoney, side, proposed.ticker, runId, makeEdits]);
 
   const isSubmitting = phase.kind === 'authenticating' || phase.kind === 'submitting';
   const isPlaced = phase.kind === 'placed';
@@ -175,6 +212,8 @@ export function useOrderTicket(runId: string, trade: TradeEvent): OrderTicket {
       biometryKind,
       isSubmitting,
       isPlaced,
+      parsedAmount,
+      reportInvalidSize,
       confirmAndSubmit,
     }),
     [
@@ -189,6 +228,8 @@ export function useOrderTicket(runId: string, trade: TradeEvent): OrderTicket {
       biometryKind,
       isSubmitting,
       isPlaced,
+      parsedAmount,
+      reportInvalidSize,
       confirmAndSubmit,
     ],
   );
@@ -244,9 +285,16 @@ function classifyFailure(error: unknown): SubmissionFailure {
           return { kind: 'generic', message: apiError.detail ?? `Order failed (HTTP ${apiError.status}).` };
       }
     }
-    case 'invalidUrl':
     case 'transport':
     case 'timeout':
+      // The POST may have reached the broker before the connection dropped/timed
+      // out, so the order might already be live. Warn rather than imply it failed.
+      return {
+        kind: 'uncertain',
+        message:
+          'Your order may still have been placed. Check your Robinhood account before retrying to avoid placing it twice.',
+      };
+    case 'invalidUrl':
     case 'decoding':
     case 'unauthorized':
     case 'cancelled':

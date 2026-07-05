@@ -41,6 +41,18 @@ export type SignUpResult =
   | { status: 'session' }
   | { status: 'confirmation_required'; email: string };
 
+/**
+ * Outcome of a best-effort token refresh. `rejected` means the server
+ * definitively refused the refresh token (e.g. 400/401 invalid_grant) — the
+ * session is dead and the caller should sign out. `transport` means the refresh
+ * could not be completed due to a network/timeout/5xx condition — the tokens may
+ * still be valid, so the caller must NOT sign out and should retry later.
+ */
+export type RefreshOutcome =
+  | { ok: true }
+  | { ok: false; reason: 'rejected' }
+  | { ok: false; reason: 'transport' };
+
 type Listener = () => void;
 
 class AuthService {
@@ -48,7 +60,7 @@ class AuthService {
   private refreshToken: string | null = null;
   private user: AuthUser | null = null;
   private loaded = false;
-  private refreshInFlight: Promise<boolean> | null = null;
+  private refreshInFlight: Promise<RefreshOutcome> | null = null;
   private listeners = new Set<Listener>();
 
   /** Whether Supabase sign-in is configured (URL + anon key present). */
@@ -201,23 +213,68 @@ class AuthService {
 
   /**
    * Best-effort, single-flight refresh used by `apiClient` / `sseClient` on a
-   * 401. Returns true if a fresh access token is now stored. Concurrent callers
-   * share one in-flight refresh.
+   * 401. Returns a discriminated `RefreshOutcome` so callers can distinguish a
+   * definitive rejection (sign out) from a transient transport failure (keep the
+   * session and retry). Concurrent callers share one in-flight refresh.
    */
-  async attemptRefresh(): Promise<boolean> {
+  async attemptRefresh(): Promise<RefreshOutcome> {
     if (this.refreshInFlight) return this.refreshInFlight;
-    const task = (async () => {
+    const task = (async (): Promise<RefreshOutcome> => {
       try {
-        await this.refresh();
-        return true;
-      } catch {
-        return false;
+        return await this.performRefresh();
       } finally {
         this.refreshInFlight = null;
       }
     })();
     this.refreshInFlight = task;
     return task;
+  }
+
+  /**
+   * Exchange the stored refresh token, classifying the result. A network/timeout
+   * error or a 5xx/429 response is `transport` (retryable, tokens preserved); a
+   * 400/401/403 or a missing/empty session is `rejected` (the refresh token is
+   * dead and the caller should sign out).
+   */
+  private async performRefresh(): Promise<RefreshOutcome> {
+    if (!this.refreshToken || !this.isConfigured) {
+      return { ok: false, reason: 'rejected' };
+    }
+    const url = `${SUPABASE_URL.replace(/\/$/, '')}/auth/v1/token?grant_type=refresh_token`;
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          apikey: SUPABASE_ANON_KEY,
+        },
+        body: JSON.stringify({ refresh_token: this.refreshToken }),
+      });
+    } catch {
+      // Transport/network/timeout — the refresh token may still be valid.
+      return { ok: false, reason: 'transport' };
+    }
+    if (!res.ok) {
+      // Only a definitive client-side auth rejection kills the session; 5xx / 429
+      // are server-side transients that should not sign the user out.
+      if (res.status === 400 || res.status === 401 || res.status === 403) {
+        return { ok: false, reason: 'rejected' };
+      }
+      return { ok: false, reason: 'transport' };
+    }
+    let session: GoTrueSession;
+    try {
+      session = (await res.json()) as GoTrueSession;
+    } catch {
+      return { ok: false, reason: 'transport' };
+    }
+    if (!session.access_token) {
+      return { ok: false, reason: 'rejected' };
+    }
+    await this.persist(session);
+    return { ok: true };
   }
 
   async signOut(): Promise<void> {

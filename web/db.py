@@ -16,12 +16,20 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("tradingagents.web.db")
 
 CACHE_KEY = "cache_enabled"
+
+# PostgREST treats ',', '.', '(', ')' and friends as filter operators, so any
+# such character interpolated into an ``or_()`` string is a filter-injection
+# vector. Only interpolate values matching a conservative safe charset; any
+# other value is skipped (the OR term is simply dropped — fail-safe).
+_SAFE_VISITOR_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_SAFE_IP_RE = re.compile(r"^[0-9A-Fa-f.:]{1,64}$")  # IPv4/IPv6 (incl. masked)
 
 _client = None
 _client_init = False
@@ -240,9 +248,9 @@ def count_quota_consumed(
             # PostgREST OR: match either visitor or IP. Both fields are stored
             # by store_event(), so a single condition tree covers both.
             ors: List[str] = []
-            if visitor_id:
+            if visitor_id and _SAFE_VISITOR_RE.match(visitor_id):
                 ors.append(f"visitor_id.eq.{visitor_id}")
-            if ip_address:
+            if ip_address and _SAFE_IP_RE.match(ip_address):
                 ors.append(f"ip_address.eq.{ip_address}")
             if ors:
                 q = q.or_(",".join(ors))

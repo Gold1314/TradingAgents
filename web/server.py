@@ -29,11 +29,10 @@ import os
 import re
 import threading
 import time
-import traceback
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -50,6 +49,7 @@ from tradingagents.brokers import (
     build_account_context,
     load_robinhood_config,
 )
+from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.graph.checkpointer import clear_checkpoint, thread_id
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -505,11 +505,20 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
         # is written here instead of being surfaced in the UI.
         log_file: Optional[Path] = None
         try:
-            run_dir = Path(config["results_dir"]) / req.ticker / str(req.trade_date)
+            # ticker/trade_date are raw client input; validate both before they
+            # flow into a filesystem path so they can't traverse out of
+            # results_dir (e.g. "../../etc"). ``safe_ticker_component`` rejects
+            # path separators; trade_date must be a plain ISO date.
+            safe_ticker = safe_ticker_component(req.ticker)
+            date.fromisoformat(str(req.trade_date))
+            results_root = Path(config["results_dir"]).resolve()
+            run_dir = (results_root / safe_ticker / str(req.trade_date)).resolve()
+            if not run_dir.is_relative_to(results_root):
+                raise ValueError("resolved run directory escapes results_dir")
             run_dir.mkdir(parents=True, exist_ok=True)
             log_file = run_dir / "message_tool.log"
             log_file.touch(exist_ok=True)
-        except OSError as exc:  # noqa: BLE001
+        except (OSError, ValueError) as exc:  # noqa: BLE001
             logger.warning("could not create tool log: %s", exc)
 
         merged: Dict[str, Any] = {}
@@ -692,10 +701,12 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
                     {"type": "trade", "status": "error", "message": str(exc)},
                 )
     except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
+        # Full traceback is logged server-side only; the client-facing event
+        # carries a generic message so we don't leak internal stack frames.
         logger.exception("run failed")
         manager.emit(
             run,
-            {"type": "error", "message": str(exc), "trace": traceback.format_exc()},
+            {"type": "error", "message": str(exc)},
         )
         db.store_event(
             {
@@ -727,12 +738,13 @@ BLUEPRINT_TOKEN_TTL = 7 * 24 * 3600  # 7 days
 def _blueprint_secret() -> Optional[str]:
     """Server-side signing secret for blueprint tokens.
 
-    Prefers an explicit secret; falls back to the Supabase service key (already
-    secret and stable across restarts). Returns None when nothing is available,
-    in which case access is denied (fail-closed)."""
+    Requires a dedicated secret (``STOCKAGENTS_BLUEPRINT_SECRET`` or, failing
+    that, the admin password). The Supabase *service-role* key is deliberately
+    NOT reused here: it grants full database access, so leaking it via a
+    token-signing bug would be far worse than a signing key. Returns None when
+    nothing is available, in which case access is denied (fail-closed)."""
     return (
         os.environ.get("STOCKAGENTS_BLUEPRINT_SECRET")
-        or os.environ.get("SUPABASE_KEY")
         or os.environ.get("STOCKAGENTS_ADMIN_PASSWORD")
         or None
     )
@@ -861,12 +873,19 @@ async def robinhood_status() -> dict:
 
 
 @app.post("/api/robinhood/connect")
-async def robinhood_connect() -> dict:
+async def robinhood_connect(
+    x_admin_password: Optional[str] = Header(default=None),
+) -> dict:
     """Authorize the Robinhood MCP (opens a browser for OAuth on first use).
+
+    These legacy endpoints drive the operator's single, process-wide broker, so
+    they are admin-gated (fail closed when no admin password is configured) —
+    per-user broker operations live under the v2 ``/api/v2/*`` surface.
 
     Blocking OAuth/handshake work runs in the thread pool so the event loop
     stays responsive. Returns the resulting status (never raises on auth
     failure — the error is reported in the payload)."""
+    _require_admin(x_admin_password)
     cfg = load_robinhood_config(DEFAULT_CONFIG)
     if not cfg.enabled:
         raise HTTPException(
@@ -903,12 +922,16 @@ def _account_payload() -> dict:
 
 
 @app.get("/api/robinhood/account")
-async def robinhood_account() -> dict:
+async def robinhood_account(
+    x_admin_password: Optional[str] = Header(default=None),
+) -> dict:
     """Live account snapshot — buying power, portfolio value, positions.
 
-    Read-only (never places an order). Returns ``{connected: false, ...}``
-    instead of raising when the broker isn't authorized yet. Blocking broker
-    work runs in the thread pool."""
+    Discloses the operator's account, so it is admin-gated (fail closed when no
+    admin password is configured). Read-only (never places an order). Returns
+    ``{connected: false, ...}`` instead of raising when the broker isn't
+    authorized yet. Blocking broker work runs in the thread pool."""
+    _require_admin(x_admin_password)
     cfg = load_robinhood_config(DEFAULT_CONFIG)
     if not cfg.enabled:
         raise HTTPException(
@@ -920,11 +943,19 @@ async def robinhood_account() -> dict:
 
 
 @app.post("/api/robinhood/orders/{run_id}")
-async def place_order(run_id: str, body: PlaceOrderRequest) -> dict:
+async def place_order(
+    run_id: str,
+    body: PlaceOrderRequest,
+    x_admin_password: Optional[str] = Header(default=None),
+) -> dict:
     """Place the order proposed by a finished run (manual mode, button click).
 
-    Applies optional ticket edits, re-clamps server-side, honors dry_run, and is
-    idempotent. Blocking broker work runs in the thread pool."""
+    Places a live order through the operator's process-wide broker, so it is
+    admin-gated (fail closed when no admin password is configured) in addition
+    to requiring the run to still exist with a pending order. Applies optional
+    ticket edits, re-clamps server-side, honors dry_run, and is idempotent.
+    Blocking broker work runs in the thread pool."""
+    _require_admin(x_admin_password)
     cfg = load_robinhood_config(DEFAULT_CONFIG)
     if not cfg.enabled or cfg.trade_mode == "off":
         raise HTTPException(status_code=409, detail="Robinhood execution is off.")
@@ -944,14 +975,29 @@ async def place_order(run_id: str, body: PlaceOrderRequest) -> dict:
 # Set ANALYTICS_ANONYMIZE_IP=false to retain full IPs.
 _ANONYMIZE_IP = os.environ.get("ANALYTICS_ANONYMIZE_IP", "true").strip().lower() != "false"
 
+# ``X-Forwarded-For`` / ``X-Real-IP`` are client-supplied and trivially
+# spoofable, so trusting them lets an attacker rotate the IP used for the run
+# quota. Only honour them when we're explicitly told we sit behind a trusted
+# edge proxy (Railway/Cloud PaaS). Default OFF: use the direct socket peer.
+_TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 
 def _client_ip(request: Request) -> tuple[Optional[str], Optional[str]]:
     """Best-effort client IP, proxy-aware. Returns (ip, raw_forwarded_for).
 
-    On Railway (and most PaaS) the app sits behind an edge proxy, so
-    ``request.client.host`` is the proxy. The real client is the first hop in
-    ``X-Forwarded-For``; we fall back to ``X-Real-IP`` then the socket peer.
+    When ``TRUST_PROXY_HEADERS`` is enabled (the app sits behind a known edge
+    proxy, e.g. Railway), the real client is the first hop in
+    ``X-Forwarded-For`` (falling back to ``X-Real-IP``). Otherwise these headers
+    are attacker-controlled and are ignored in favour of the direct socket
+    peer, so IP-based quota/geo can't be spoofed by header injection.
     """
+    direct = request.client.host if request.client else None
+    if not _TRUST_PROXY_HEADERS:
+        return direct, None
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
         ip = fwd.split(",")[0].strip()
@@ -959,7 +1005,7 @@ def _client_ip(request: Request) -> tuple[Optional[str], Optional[str]]:
     real = request.headers.get("x-real-ip")
     if real:
         return real.strip(), None
-    return (request.client.host if request.client else None), None
+    return direct, None
 
 
 def _anonymize_ip(ip: Optional[str]) -> Optional[str]:
@@ -1336,7 +1382,9 @@ def get_chart(ticker: str, trade_date: str, asset_type: str = "stock", lookback:
 def _require_admin(password: Optional[str]) -> None:
     if not ADMIN_PASSWORD:
         raise HTTPException(status_code=503, detail="admin features are not configured")
-    if password != ADMIN_PASSWORD:
+    # Constant-time compare to avoid leaking the password via timing. Fail
+    # closed when the caller sent nothing.
+    if not password or not hmac.compare_digest(password, ADMIN_PASSWORD):
         raise HTTPException(status_code=401, detail="invalid admin password")
 
 
@@ -1437,8 +1485,18 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # must degrade gracefully (skip the mobile API) rather than crash the server.
 try:
     from web.mobile import include_mobile_api  # noqa: E402
+    from web.mobile.settings import load_settings as _load_mobile_settings  # noqa: E402
 
     include_mobile_api(app)
+    # Loud, fail-visible warning: dev auth mints tokens for ANY user_id from a
+    # single shared secret, so it must never front a production mobile API.
+    _ms = _load_mobile_settings()
+    if _ms.enabled and _ms.auth_mode == "dev":
+        logger.warning(
+            "SECURITY: MOBILE_API_ENABLED with MOBILE_AUTH_MODE=dev — dev "
+            "bearer tokens are forgeable by anyone holding the signing secret. "
+            "Do NOT use in production; set MOBILE_AUTH_MODE=supabase."
+        )
 except ImportError as exc:  # noqa: BLE001 — mobile API is optional
     logger.warning("Mobile API unavailable, skipping (/api/v2 disabled): %s", exc)
 

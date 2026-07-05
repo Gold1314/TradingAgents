@@ -283,18 +283,18 @@ def get_run_owner(run_id: str) -> Optional[str]:
     every Supabase-UUID comparison and produced spurious 403s on cached
     voice sessions.
 
-    Fail-open contract: returns ``None`` when:
+    Returns ``None`` (treated by the caller as "genuinely ownerless, allow")
+    when:
       * Supabase isn't configured,
-      * the ``user_id`` column doesn't exist yet on this deployment (older
-        schemas — pre-migration),
       * the run row exists but has no ``user_id`` (legacy web-flow runs that
         were created before the column was wired in), or
-      * any query error occurs.
+      * the run row doesn't exist.
 
-    The caller (:func:`web.voice.router._assert_run_owner`) treats ``None``
-    as "can't enforce" and lets the request through, so legacy runs remain
-    accessible while still enforcing ownership for runs that *do* have an
-    owner recorded.
+    A genuine *query error* (including the ``user_id`` column missing on a
+    pre-migration schema) is **not** swallowed here — it is re-raised so the
+    caller can fail CLOSED rather than mistaking an error for "ownerless" and
+    granting access. Deployments running the voice ownership check must have
+    the ``runs.user_id`` column migrated in.
     """
     client = _client()
     if client is None or not run_id:
@@ -307,9 +307,9 @@ def get_run_owner(run_id: str) -> Optional[str]:
             .limit(1)
             .execute()
         )
-    except Exception as exc:  # noqa: BLE001 — fail-open per docstring
+    except Exception as exc:  # noqa: BLE001 — fail CLOSED: let the caller deny
         logger.debug("voice get_run_owner query failed: %s", exc)
-        return None
+        raise
     rows = res.data or []
     if not rows:
         return None

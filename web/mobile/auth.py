@@ -53,6 +53,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+import anyio
 from fastapi import Header, HTTPException
 
 from web.mobile.settings import MobileSettings, load_settings
@@ -104,13 +105,14 @@ class User:
 def _dev_secret(settings: MobileSettings) -> Optional[str]:
     """Signing secret for dev tokens.
 
-    Prefers an explicit ``MOBILE_AUTH_SECRET``; falls back to other server-side
-    secrets that are already stable across restarts. Returns ``None`` when
-    nothing is available, in which case dev auth fails closed.
+    Requires a dedicated secret: an explicit ``MOBILE_AUTH_SECRET`` or, failing
+    that, the admin password. The Supabase *service-role* key
+    (``SUPABASE_KEY``) is deliberately NOT reused — it grants full database
+    access, so a token-signing bug must not be able to expose it. Returns
+    ``None`` when nothing is available, in which case dev auth fails closed.
     """
     return (
         settings.auth_secret
-        or os.environ.get("SUPABASE_KEY")
         or os.environ.get("STOCKAGENTS_ADMIN_PASSWORD")
         or None
     )
@@ -336,5 +338,9 @@ def resolve_user(authorization: Optional[str], settings: Optional[MobileSettings
 
 
 async def current_user(authorization: Optional[str] = Header(default=None)) -> User:
-    """FastAPI dependency: the authenticated user for a v2 request."""
-    return resolve_user(authorization)
+    """FastAPI dependency: the authenticated user for a v2 request.
+
+    ``resolve_user`` can perform a blocking JWKS HTTP GET (supabase mode, on a
+    cache miss), so run it in a worker thread to keep the event loop responsive.
+    """
+    return await anyio.to_thread.run_sync(resolve_user, authorization)
