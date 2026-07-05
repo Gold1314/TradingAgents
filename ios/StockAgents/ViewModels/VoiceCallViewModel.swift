@@ -46,6 +46,9 @@ final class VoiceCallViewModel: ObservableObject {
     private var client: VoiceCallClient?
     private var startedSession: VoiceSessionStartResponse?
     private var eventTask: Task<Void, Never>?
+    /// Guards ``hangup()`` so the explicit End-call button and the view's
+    /// `onDisappear` can't double-disconnect the room.
+    private var didHangUp = false
 
     init(runID: String, agentID: String, api: APIClient) {
         self.runID = runID
@@ -85,8 +88,12 @@ final class VoiceCallViewModel: ObservableObject {
         isMuted = await client.toggleMute()
     }
 
-    /// Hang up and dismiss. Safe to call multiple times.
+    /// Hang up and dismiss. Idempotent — safe to call multiple times and from
+    /// both the End-call button and the view's `onDisappear` (swipe-dismiss), so
+    /// the room/mic teardown always runs and never runs twice.
     func hangup() async {
+        guard !didHangUp else { return }
+        didHangUp = true
         await client?.hangup()
         client = nil
         phase = .ended

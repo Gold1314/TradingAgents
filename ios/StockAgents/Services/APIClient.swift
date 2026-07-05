@@ -143,12 +143,21 @@ final class APIClient {
         do {
             return try await send(request)
         } catch APIError.unauthorized {
-            guard await auth.attemptRefresh() else {
+            switch await auth.attemptRefresh() {
+            case .refreshed:
+                let retry = try await makeRequest(path: path, method: method, body: body)
+                return try await send(retry)
+            case .rejected:
+                // Definitive rejection of the refresh token → sign out.
                 await auth.signOut()
                 throw APIError.unauthorized
+            case .transient:
+                // Network error during refresh — keep the session and surface a
+                // retryable transport error instead of force-signing-out.
+                throw APIError.transport(
+                    "Couldn't reach the server to refresh your session. Check your connection and try again."
+                )
             }
-            let retry = try await makeRequest(path: path, method: method, body: body)
-            return try await send(retry)
         }
     }
 

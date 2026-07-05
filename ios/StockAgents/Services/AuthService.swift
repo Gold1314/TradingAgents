@@ -33,7 +33,7 @@ final class AuthService: ObservableObject {
 
     /// Coalesces concurrent refreshes (e.g. several 401s in flight at once) so
     /// only one refresh-token exchange runs and all callers await its result.
-    private var refreshTask: Task<Bool, Never>?
+    private var refreshTask: Task<RefreshOutcome, Never>?
 
     init(keychain: KeychainStore, config: SupabaseConfig? = SupabaseConfig.resolve(), session: URLSession = .shared) {
         self.keychain = keychain
@@ -93,23 +93,58 @@ final class AuthService: ObservableObject {
         state = .signedIn(session.authUser)
     }
 
-    /// Best-effort, coalesced refresh used by `APIClient` on a 401. Returns
-    /// `true` if a fresh access token is now stored. Concurrent callers share a
-    /// single in-flight refresh.
-    func attemptRefresh() async -> Bool {
+    /// Outcome of an `attemptRefresh()`. Distinguishing a *definitive* rejection
+    /// of the refresh token from a *transient* transport error is critical: only
+    /// the former should sign the user out (deleting the Keychain refresh token).
+    /// A network blip must NOT nuke a valid session.
+    enum RefreshOutcome: Equatable {
+        /// A fresh access token is now stored.
+        case refreshed
+        /// The server definitively rejected the refresh token (invalid_grant /
+        /// 400 / 401) or there is nothing to refresh with — sign out.
+        case rejected
+        /// A transport/network error prevented the refresh — keep the tokens and
+        /// let the caller retry; do NOT sign out.
+        case transient
+    }
+
+    /// Best-effort, coalesced refresh used by `APIClient` / `RunStreamClient` on
+    /// a 401. Concurrent callers share a single in-flight refresh. The returned
+    /// ``RefreshOutcome`` tells the caller whether a failure was definitive
+    /// (sign out) or transient (keep tokens, retry).
+    func attemptRefresh() async -> RefreshOutcome {
         if let refreshTask { return await refreshTask.value }
-        let task = Task { () -> Bool in
+        let task = Task { () -> RefreshOutcome in
             do {
                 try await self.refresh()
-                return true
+                return .refreshed
+            } catch let error as AuthError {
+                return AuthService.classify(error)
             } catch {
-                return false
+                // Unknown error shape — be conservative and treat as transient
+                // so a valid session isn't discarded on an ambiguous failure.
+                return .transient
             }
         }
         refreshTask = task
         let result = await task.value
         refreshTask = nil
         return result
+    }
+
+    /// Map a refresh `AuthError` onto a ``RefreshOutcome``. A `400`/`401` from
+    /// GoTrue means the refresh token was rejected (definitive → sign out); a
+    /// missing/unconfigured token likewise leaves nothing to recover. Everything
+    /// else (transport, decoding, 5xx) is treated as transient — keep the tokens.
+    private static func classify(_ error: AuthError) -> RefreshOutcome {
+        switch error {
+        case .server(let status, _):
+            return (status == 400 || status == 401) ? .rejected : .transient
+        case .noRefreshToken, .notConfigured:
+            return .rejected
+        case .transport, .decoding:
+            return .transient
+        }
     }
 
     // MARK: - Sign out

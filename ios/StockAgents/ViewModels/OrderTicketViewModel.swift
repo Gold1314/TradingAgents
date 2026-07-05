@@ -67,9 +67,19 @@ final class OrderTicketViewModel: ObservableObject {
     let runID: String
     let proposed: OrderIntent
     /// Whether this submission moves real money (drives styling + the gate).
-    let placesRealMoney: Bool
+    ///
+    /// Seeded conservatively from the run-completion `trade` snapshot, then
+    /// REPLACED by a fresh `GET /api/v2/robinhood/status` when the ticket opens
+    /// (see ``refreshTradeMode()``). The biometric gate reads this at confirm
+    /// time, so an operator flipping dry_run→live after the run finished can't
+    /// slip a real order past a stale "Simulated" snapshot.
+    @Published private(set) var placesRealMoney: Bool
     /// Whether the broker is in dry-run/simulated mode.
-    let isDryRun: Bool
+    @Published private(set) var isDryRun: Bool
+    /// True once the fresh broker status has been resolved (fetched or, on
+    /// failure, fail-safe applied). The confirm action is blocked until then so
+    /// the gate is never decided from the stale snapshot alone.
+    @Published private(set) var statusChecked = false
 
     private let api: APIClient
     private let biometrics: BiometricAuthenticator
@@ -91,8 +101,11 @@ final class OrderTicketViewModel: ObservableObject {
         self.proposed = intent
         self.side = (intent.action == "sell") ? .sell : .buy
         self.orderType = intent.orderType
-        self.notionalText = intent.notional.map { String(format: "%.2f", $0) } ?? ""
-        self.quantityText = intent.quantity.map { Self.trimQuantity($0) } ?? ""
+        // Seed with locale-aware formatting so the displayed separator matches
+        // what `.decimalPad` produces AND what `parseAmount` expects — a
+        // decimal-comma user sees "100,50", not a period they can't reproduce.
+        self.notionalText = intent.notional.map { Self.formatAmount($0, fractionDigits: 2) } ?? ""
+        self.quantityText = intent.quantity.map { Self.formatAmount($0, fractionDigits: 8) } ?? ""
 
         let dryRun = trade.dryRun ?? true
         self.isDryRun = dryRun
@@ -124,6 +137,24 @@ final class OrderTicketViewModel: ObservableObject {
     /// Only then is `POST /api/robinhood/orders/{run_id}` sent. A simulated /
     /// dry-run placement skips step 2 (still confirmed), per §5.3.
     func confirmAndSubmit() async {
+        // Reentrancy guard: ignore a second confirm while a gate/submit is
+        // already in flight (e.g. a rapid double-tap), so we never fire two
+        // orders. Retrying after a `.failed` result is still allowed.
+        guard !isSubmitting else { return }
+
+        // Validate sizing BEFORE any biometric prompt or network call. A blank
+        // or unparseable amount must NOT be sent as null — for a LIVE order the
+        // server would fall back to its own default, authorizing an amount the
+        // user never typed. Block with a clear message instead.
+        guard let edits = validatedEdits() else {
+            phase = .failed(.validation(
+                side == .buy
+                    ? "Enter a valid dollar amount before placing this order."
+                    : "Enter a valid share quantity before placing this order."
+            ))
+            return
+        }
+
         do {
             if placesRealMoney {
                 phase = .authenticating
@@ -132,10 +163,28 @@ final class OrderTicketViewModel: ObservableObject {
                 )
             }
             phase = .submitting
-            let result = try await api.submitOrder(runID: runID, edits: makeEdits())
+            let result = try await api.submitOrder(runID: runID, edits: edits)
             phase = .placed(result)
         } catch {
             phase = failurePhase(for: error)
+        }
+    }
+
+    /// Re-fetch the broker's CURRENT trade-safety flags when the ticket opens and
+    /// gate LIVE-vs-simulated (and thus the Face ID requirement) on them, rather
+    /// than on the flags snapshotted at run completion (plan §5.3). If the fresh
+    /// status can't be fetched we FAIL SAFE: treat the order as LIVE so the
+    /// biometric gate is required rather than silently skipped.
+    func refreshTradeMode() async {
+        defer { statusChecked = true }
+        do {
+            let status = try await api.robinhoodStatus()
+            placesRealMoney = status.placesRealMoney
+            isDryRun = status.dryRun ?? true
+        } catch {
+            // Fail safe: can't confirm it's simulated → treat as real money.
+            placesRealMoney = true
+            isDryRun = false
         }
     }
 
@@ -145,23 +194,66 @@ final class OrderTicketViewModel: ObservableObject {
 
     // MARK: - Helpers
 
-    /// Build the edit payload. The ticker is never sent (server forces the run's
-    /// own); we send only the fields the user can change. One sizing field is
-    /// kept per side — buys size by notional, sells by quantity — matching the
-    /// server's normalization in `_place_pending_order`.
-    private func makeEdits() -> PlaceOrderRequest {
+    /// Parsed, locale-aware sizing values (nil when the field is empty or not a
+    /// valid number). Exposed so the view's confirmation copy formats the SAME
+    /// value that will be submitted.
+    var notionalValue: Double? { Self.parseAmount(notionalText) }
+    var quantityValue: Double? { Self.parseAmount(quantityText) }
+
+    /// Build the edit payload IFF the active sizing field parses to a positive
+    /// number; returns nil otherwise so the caller can block submission. The
+    /// ticker is never sent (server forces the run's own); we send only the
+    /// fields the user can change. One sizing field is kept per side — buys size
+    /// by notional, sells by quantity — matching the server's normalization in
+    /// `_place_pending_order`.
+    private func validatedEdits() -> PlaceOrderRequest? {
         var edits = PlaceOrderRequest()
         edits.action = side.rawValue
         edits.orderType = orderType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         switch side {
         case .buy:
-            edits.notional = Double(notionalText.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard let notional = notionalValue, notional > 0 else { return nil }
+            edits.notional = notional
             edits.quantity = nil
         case .sell:
-            edits.quantity = Double(quantityText.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard let quantity = quantityValue, quantity > 0 else { return nil }
+            edits.quantity = quantity
             edits.notional = nil
         }
         return edits
+    }
+
+    /// Parse a user-entered decimal that may use either '.' or ',' as the decimal
+    /// separator: `.decimalPad` yields the *locale's* separator, but `Double(_:)`
+    /// only accepts '.', so a decimal-comma user's input would otherwise parse to
+    /// nil and get silently dropped. Returns nil for empty/invalid input.
+    static func parseAmount(_ text: String) -> Double? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        // Prefer the current locale (handles the user's own decimalPad output,
+        // including a comma decimal + any grouping separators).
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.locale = .current
+        if let number = formatter.number(from: trimmed) {
+            return number.doubleValue
+        }
+        // Fallback: normalize a lone comma decimal to a period (e.g. a
+        // comma-decimal string on a period-locale device) and parse plainly.
+        return Double(trimmed.replacingOccurrences(of: ",", with: "."))
+    }
+
+    /// Format a value for an editable sizing field: locale-aware decimal
+    /// separator, NO grouping separators (so it round-trips cleanly through
+    /// `parseAmount`), and trailing zeros trimmed.
+    private static func formatAmount(_ value: Double, fractionDigits: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.locale = .current
+        formatter.usesGroupingSeparator = false
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = fractionDigits
+        return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
     }
 
     /// Classify a thrown error into a `.failed` phase with an actionable
@@ -217,12 +309,5 @@ final class OrderTicketViewModel: ObservableObject {
             // app drops to signed-out), .transport, .decoding, .invalidURL, etc.
             return .failed(.generic(apiError.errorDescription ?? "Order submission failed."))
         }
-    }
-
-    private static func trimQuantity(_ value: Double) -> String {
-        if value == value.rounded() {
-            return String(format: "%.0f", value)
-        }
-        return String(value)
     }
 }

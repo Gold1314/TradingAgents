@@ -8,19 +8,26 @@ import Security
 struct KeychainStore {
     let service: String
 
-    func set(_ value: String, for key: String) {
-        guard let data = value.data(using: .utf8) else { return }
+    /// Store (or replace) a value. Returns `true` on success so callers can
+    /// react to a Security-framework failure rather than silently losing a
+    /// token. `@discardableResult` keeps existing call sites unchanged.
+    @discardableResult
+    func set(_ value: String, for key: String) -> Bool {
+        guard let data = value.data(using: .utf8) else { return false }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
         ]
+        // Delete any existing item first; `errSecItemNotFound` is expected and
+        // fine — we only care whether the subsequent add succeeds.
         SecItemDelete(query as CFDictionary)
 
         var attributes = query
         attributes[kSecValueData as String] = data
         attributes[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        SecItemAdd(attributes as CFDictionary, nil)
+        let status = SecItemAdd(attributes as CFDictionary, nil)
+        return status == errSecSuccess
     }
 
     func get(_ key: String) -> String? {
@@ -37,12 +44,16 @@ struct KeychainStore {
         return String(data: data, encoding: .utf8)
     }
 
-    func delete(_ key: String) {
+    /// Remove a value. Returns `true` when the item is gone afterwards (either
+    /// deleted, or it wasn't there to begin with).
+    @discardableResult
+    func delete(_ key: String) -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
         ]
-        SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 }

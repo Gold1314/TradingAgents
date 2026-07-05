@@ -63,6 +63,9 @@ struct RootView: View {
     }
 
     private func handleStartResponse(_ response: StartRunResponse) {
+        // Tear down any prior session's SSE stream before replacing it, so the
+        // old connection doesn't leak when the user starts a new run.
+        activeSession?.stop()
         let session = env.makeSessionViewModel()
         switch response {
         case .started(let runID, let nodes):
@@ -78,6 +81,7 @@ struct RootView: View {
         guard !didAttemptRestore else { return }
         didAttemptRestore = true
         guard let saved = env.activeRunStore.load() else { return }
+        activeSession?.stop()
         let session = env.makeSessionViewModel()
         await session.restore(runID: saved.runID, request: saved.request, fallbackNodes: saved.nodes)
         if case .failed = session.phase { return } // run expired; stay on setup

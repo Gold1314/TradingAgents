@@ -37,6 +37,12 @@ struct VoiceCallView: View {
             viewModel.onHandoffPicked = onHandoffPicked
             await viewModel.start()
         }
+        .onDisappear {
+            // Swipe-to-dismiss bypasses the End-call button; ensure the room,
+            // mic, and event stream are always torn down. `hangup()` is
+            // idempotent, so this is safe alongside the explicit End-call path.
+            Task { await viewModel.hangup() }
+        }
     }
 
     // MARK: - Sections

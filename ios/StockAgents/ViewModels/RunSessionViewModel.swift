@@ -63,6 +63,13 @@ final class RunSessionViewModel: ObservableObject {
         self.activeRunStore = activeRunStore
     }
 
+    /// Cancel the SSE consume task if this view model is deallocated while a
+    /// stream is still live (e.g. it was replaced without an explicit `stop()`),
+    /// so the connection doesn't leak.
+    deinit {
+        streamTask?.cancel()
+    }
+
     /// Agent cards in planned pipeline order (only those we've seen or planned).
     var orderedAgents: [AgentCardState] {
         plannedNodes.compactMap { agents[$0] }

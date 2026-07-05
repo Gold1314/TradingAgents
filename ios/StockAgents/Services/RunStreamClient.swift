@@ -75,8 +75,16 @@ final class RunStreamClient {
                             return
                         }
                         // Stream ended without a terminal `done` (e.g. server
-                        // closed the connection). Reconnect and resume.
+                        // closed the connection). Reconnect and resume — but the
+                        // reconnect budget is capped on this path too, otherwise a
+                        // server that keeps closing cleanly loops forever.
                         attempts += 1
+                        if attempts >= self.maxReconnectAttempts {
+                            continuation.finish(throwing: APIError.transport(
+                                "The event stream closed repeatedly without completing."
+                            ))
+                            return
+                        }
                     } catch is CancellationError {
                         continuation.finish()
                         return
@@ -85,19 +93,40 @@ final class RunStreamClient {
                         // token has almost certainly expired mid-run. Refresh it
                         // (single-flight, shared with `APIClient`) and reconnect
                         // immediately with the new bearer + the preserved
-                        // `Last-Event-ID`, so no events are missed.
-                        authRefreshAttempts += 1
-                        let refreshed = authRefreshAttempts <= self.maxAuthRefreshAttempts
-                            && (await self.auth.attemptRefresh())
-                        if !refreshed {
-                            // Refresh failed (or kept being rejected): drop to a
-                            // signed-out/auth-error state like `APIClient`, and
-                            // stop reconnecting.
+                        // `Last-Event-ID`, so no events are missed. We only sign
+                        // out on a *definitive* rejection of the refresh token — a
+                        // transport blip during refresh keeps the tokens and just
+                        // backs off.
+                        switch await self.auth.attemptRefresh() {
+                        case .refreshed:
+                            authRefreshAttempts += 1
+                            if authRefreshAttempts > self.maxAuthRefreshAttempts {
+                                // Refresh keeps succeeding yet the server keeps
+                                // rejecting the token — treat as a hard auth
+                                // failure and stop, like `APIClient` does.
+                                await self.auth.signOut()
+                                continuation.finish(throwing: APIError.unauthorized)
+                                return
+                            }
+                            continue // reconnect now, no backoff — the token is fresh
+                        case .rejected:
+                            // The refresh token itself was rejected: drop to a
+                            // signed-out/auth-error state like `APIClient`.
                             await self.auth.signOut()
                             continuation.finish(throwing: APIError.unauthorized)
                             return
+                        case .transient:
+                            // Network error during refresh — do NOT sign out.
+                            // Keep the tokens and back off, bounded by the generic
+                            // reconnect budget.
+                            attempts += 1
+                            if attempts >= self.maxReconnectAttempts {
+                                continuation.finish(throwing: APIError.transport(
+                                    "Couldn't refresh your session — network error."
+                                ))
+                                return
+                            }
                         }
-                        continue // reconnect now, no backoff — the token is fresh
                     } catch {
                         attempts += 1
                         if attempts >= self.maxReconnectAttempts {
@@ -139,42 +168,35 @@ final class RunStreamClient {
             try APIClient.validate(http, data: Data())
         }
 
-        var dataBuffer = ""
-        var pendingID: Int?
+        // Drive a pure, incremental frame parser off the RAW byte stream.
+        //
+        // We deliberately do NOT use `bytes.lines` (`AsyncLineSequence`): it
+        // SKIPS empty lines, so the blank-line SSE frame delimiter never
+        // arrives and no event is ever dispatched. Reading raw `UInt8`s and
+        // splitting on `\n` ourselves preserves those blank lines.
+        var parser = SSEFrameParser()
         let decoder = JSONDecoder()
 
-        for try await line in bytes.lines {
+        for try await byte in bytes {
             try Task.checkCancellation()
+            guard let frame = parser.consume(byte) else { continue }
 
-            // Blank line => dispatch the buffered event frame.
-            if line.isEmpty {
-                guard !dataBuffer.isEmpty else {
-                    pendingID = nil
-                    continue
-                }
-                if let payload = dataBuffer.data(using: .utf8) {
-                    let event = try decoder.decode(AgentEvent.self, from: payload)
-                    onEvent(StreamedEvent(id: pendingID, event: event))
-                    if case .done = event { return true }
-                }
-                dataBuffer = ""
-                pendingID = nil
+            guard let payload = frame.data.data(using: .utf8) else { continue }
+            // A single malformed frame must NOT tear down the whole stream: a
+            // decode failure here would throw, skip yielding the frame, and —
+            // because `resumeID` never advanced past it — replay the same poison
+            // event on every reconnect. Instead we surface it as an `.unknown`
+            // event (which the UI ignores) so `resumeID` still advances and the
+            // bad frame is never replayed.
+            let event: AgentEvent
+            do {
+                event = try decoder.decode(AgentEvent.self, from: payload)
+            } catch {
+                onEvent(StreamedEvent(id: frame.id, event: .unknown("decode_error")))
                 continue
             }
-
-            // Comment / keepalive line.
-            if line.hasPrefix(":") { continue }
-
-            let (field, value) = RunStreamClient.parseField(line)
-            switch field {
-            case "id":
-                pendingID = Int(value)
-            case "data":
-                // SSE concatenates multiple data: lines with newlines.
-                dataBuffer += dataBuffer.isEmpty ? value : "\n" + value
-            default:
-                break // ignore event:/retry: — the server doesn't use them
-            }
+            onEvent(StreamedEvent(id: frame.id, event: event))
+            if case .done = event { return true }
         }
         return false
     }
@@ -189,5 +211,86 @@ final class RunStreamClient {
         var value = String(line[line.index(after: colon)...])
         if value.hasPrefix(" ") { value.removeFirst() }
         return (field, value)
+    }
+}
+
+/// One fully-assembled SSE event frame (a blank-line-delimited block). The `id`
+/// is the parsed `id:` line (used for resume); `data` is the concatenated
+/// `data:` payload, ready to be JSON-decoded by the caller.
+struct SSEFrame: Equatable {
+    let id: Int?
+    let data: String
+}
+
+/// Pure, synchronous, incremental SSE frame assembler.
+///
+/// Feed it raw bytes as they arrive off the wire (`consume(_:)` per byte, or
+/// `feed(_:)` for a chunk); it emits an ``SSEFrame`` each time a blank line
+/// closes a buffered event. Unlike `URLSession.AsyncBytes.lines`
+/// (`AsyncLineSequence`), which silently drops empty lines, this parser
+/// PRESERVES blank lines — the SSE frame delimiter — so events are actually
+/// dispatched. It also:
+///   * handles both `\n` and `\r\n` line endings (a trailing `\r` is stripped),
+///   * ignores `:` comment / keepalive lines,
+///   * concatenates multiple `data:` lines with newlines (per the SSE spec),
+///   * tracks the last `id:` for resume bookkeeping.
+///
+/// It performs NO JSON decoding — the caller decodes ``SSEFrame/data`` into its
+/// own event type, keeping this logic transport-free and unit-testable.
+struct SSEFrameParser {
+    private var lineBytes: [UInt8] = []
+    private var dataBuffer = ""
+    private var pendingID: Int?
+
+    /// Feed one byte. Returns a frame iff a blank line just closed a buffered
+    /// event; otherwise `nil`.
+    mutating func consume(_ byte: UInt8) -> SSEFrame? {
+        guard byte == 0x0A else { // 0x0A == "\n"
+            lineBytes.append(byte)
+            return nil
+        }
+        // Strip a single trailing "\r" so CRLF endings behave like LF.
+        if lineBytes.last == 0x0D { lineBytes.removeLast() } // 0x0D == "\r"
+        let line = String(decoding: lineBytes, as: UTF8.self)
+        lineBytes.removeAll(keepingCapacity: true)
+        return handleLine(line)
+    }
+
+    /// Feed a chunk of bytes, returning every frame completed within it.
+    mutating func feed<S: Sequence>(_ bytes: S) -> [SSEFrame] where S.Element == UInt8 {
+        var frames: [SSEFrame] = []
+        for byte in bytes {
+            if let frame = consume(byte) { frames.append(frame) }
+        }
+        return frames
+    }
+
+    private mutating func handleLine(_ line: String) -> SSEFrame? {
+        // Blank line => dispatch the buffered event frame.
+        if line.isEmpty {
+            guard !dataBuffer.isEmpty else {
+                pendingID = nil
+                return nil
+            }
+            let frame = SSEFrame(id: pendingID, data: dataBuffer)
+            dataBuffer = ""
+            pendingID = nil
+            return frame
+        }
+
+        // Comment / keepalive line (": keepalive").
+        if line.hasPrefix(":") { return nil }
+
+        let (field, value) = RunStreamClient.parseField(line)
+        switch field {
+        case "id":
+            pendingID = Int(value)
+        case "data":
+            // SSE concatenates multiple data: lines with newlines.
+            dataBuffer += dataBuffer.isEmpty ? value : "\n" + value
+        default:
+            break // ignore event:/retry: — the server doesn't use them
+        }
+        return nil
     }
 }

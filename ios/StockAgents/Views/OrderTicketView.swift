@@ -93,10 +93,21 @@ struct OrderTicketView: View {
                             Spacer()
                         }
                     }
-                    .disabled(viewModel.isSubmitting || viewModel.liveBlockedByMissingBiometrics || isPlaced)
+                    .disabled(
+                        viewModel.isSubmitting
+                        || viewModel.liveBlockedByMissingBiometrics
+                        || isPlaced
+                        || !viewModel.statusChecked
+                    )
                     .listRowBackground(primaryColor)
                     .foregroundStyle(Theme.background)
                 }
+            }
+            .task {
+                // Re-fetch the broker's CURRENT trade-safety flags so LIVE-vs-
+                // simulated (and the Face ID gate) is decided from fresh server
+                // state, not the run-completion snapshot. Fails safe to LIVE.
+                await viewModel.refreshTradeMode()
             }
             .navigationTitle("Order ticket")
             .navigationBarTitleDisplayMode(.inline)
@@ -224,7 +235,7 @@ struct OrderTicketView: View {
     }
 
     private var primaryColor: Color {
-        if viewModel.isSubmitting || viewModel.liveBlockedByMissingBiometrics || isPlaced {
+        if viewModel.isSubmitting || viewModel.liveBlockedByMissingBiometrics || isPlaced || !viewModel.statusChecked {
             return Theme.border
         }
         return viewModel.placesRealMoney ? Theme.danger : Theme.accent
@@ -244,7 +255,7 @@ struct OrderTicketView: View {
     private var confirmMessage: String {
         let size: String
         if viewModel.side == .buy {
-            size = Formatters.usd(Double(viewModel.notionalText))
+            size = Formatters.usd(viewModel.notionalValue)
         } else {
             size = "\(viewModel.quantityText) shares"
         }
