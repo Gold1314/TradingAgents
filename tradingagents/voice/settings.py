@@ -53,6 +53,11 @@ ENV_SESSION_MAX_SECONDS = "TRADINGAGENTS_VOICE_SESSION_MAX_SECONDS"
 ENV_DAILY_MINUTES_PER_USER = "TRADINGAGENTS_VOICE_MINUTES_PER_USER_PER_DAY"
 ENV_HOURLY_SESSIONS_PER_USER = "TRADINGAGENTS_VOICE_SESSIONS_PER_USER_PER_HOUR"
 
+# Max agents in one panel call. More panelists = higher per-turn cost (each
+# swap loads a persona) and slower routing, so keep this small. Hard-clamped
+# to ``panel.MAX_PANEL_AGENTS_HARD`` in :func:`panel.normalize_roster`.
+ENV_PANEL_MAX_AGENTS = "TRADINGAGENTS_VOICE_PANEL_MAX_AGENTS"
+
 # Room JWT TTL. Shorter is safer — clients renew if a call lasts longer.
 ENV_TOKEN_TTL_SECONDS = "TRADINGAGENTS_VOICE_TOKEN_TTL_SECONDS"
 
@@ -120,6 +125,7 @@ class VoiceSettings:
     daily_minutes_per_user: int
     hourly_sessions_per_user: int
     token_ttl_seconds: int
+    panel_max_agents: int
 
     @property
     def transport_configured(self) -> bool:
@@ -172,4 +178,5 @@ def load_settings() -> VoiceSettings:
         daily_minutes_per_user=_int_env(ENV_DAILY_MINUTES_PER_USER, 30),
         hourly_sessions_per_user=_int_env(ENV_HOURLY_SESSIONS_PER_USER, 12),
         token_ttl_seconds=_int_env(ENV_TOKEN_TTL_SECONDS, 1800),
+        panel_max_agents=_int_env(ENV_PANEL_MAX_AGENTS, 4),
     )

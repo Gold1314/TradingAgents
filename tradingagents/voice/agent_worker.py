@@ -49,6 +49,7 @@ from tradingagents.voice.handoff import (
     detect_handoff,
     detect_reconcile_request,
 )
+from tradingagents.voice import panel
 from tradingagents.voice.personas import VoicePersona, get_persona
 from tradingagents.voice.settings import VoiceSettings, load_settings
 from web.voice import db as voice_db
@@ -232,6 +233,278 @@ async def _publish_data_event(room: Any, payload: dict) -> None:
         logger.warning("voice data publish failed: %s", exc)
 
 
+async def _run_panel_session(
+    ctx: Any, settings: VoiceSettings, pricing: _Pricing, metadata: dict
+) -> None:
+    """Run a multi-agent *panel* call (moderated turn-taking) in one room.
+
+    The room already contains several personas' worth of context. We build one
+    LiveKit ``Agent`` per panelist — each carrying its own persona instructions
+    and its own TTS voice — and one shared ``AgentSession`` (STT/LLM/VAD). On
+    every finalized user turn the pure moderator (:func:`panel.select_speaker`)
+    picks who answers; we ``update_agent`` to that persona (which also switches
+    the spoken voice) before the reply is generated, so the right agent answers
+    in the right voice. The user can also direct a turn: the client publishes a
+    ``panel.direct`` data message which we honor on the next turn.
+
+    INTEGRATION NOTE: swapping the active agent inside the ``user_input_transcribed``
+    handler is the documented LiveKit multi-agent hand-off mechanism, but the
+    exact ordering vs. the session's automatic reply generation depends on the
+    installed ``livekit-agents`` version and MUST be validated against live
+    LiveKit — it cannot be exercised in unit tests (no audio/RTC here). The
+    *routing decision* is fully covered by ``tests/test_voice_panel.py``; this
+    function is the thin, best-effort glue around it.
+    """
+    from livekit.agents.voice import Agent, AgentSession  # noqa: PLC0415
+
+    run_id = metadata.get("run_id")
+    session_id = metadata.get("session_id")
+    user_id = metadata.get("user_id")
+    agent_ids = metadata.get("agent_ids") or []
+    if not (run_id and session_id and len(agent_ids) >= 2):
+        logger.error("voice panel room missing required metadata: %s", metadata)
+        return
+
+    personas = {}
+    for aid in agent_ids:
+        p = get_persona(aid)
+        if p is not None:
+            personas[aid] = p
+    if len(personas) < 2:
+        logger.error("voice panel has fewer than 2 known personas: %s", agent_ids)
+        return
+    roster = [aid for aid in agent_ids if aid in personas]
+
+    run_context = load_run_context(run_id, manager=None)
+    if run_context is None:
+        await _publish_data_event(
+            ctx.room,
+            {
+                "kind": "voice_error",
+                "code": "no_run_context",
+                "message": (
+                    "I couldn't load the analysis for this run. It may still "
+                    "be finishing — wait a moment and try again."
+                ),
+            },
+        )
+        await ctx.room.disconnect()
+        return
+
+    roster_display = [personas[aid].display_name for aid in roster]
+
+    # One Agent per persona: its own panel-framed instructions and its own
+    # TTS voice, so update_agent() swaps both the reasoning and the voice.
+    agents: Dict[str, Any] = {}
+    for aid in roster:
+        persona = personas[aid]
+        solo_prompt = build_system_prompt(persona, run_context)
+        panel_prompt = panel.build_panel_system_prompt(
+            persona, solo_prompt, roster_display
+        )
+        agents[aid] = Agent(instructions=panel_prompt, tts=_build_tts(settings, persona))
+
+    lead = panel.lead_agent(roster)
+
+    # Shared session — STT/LLM/VAD are room-wide; TTS is per-Agent (above).
+    session = AgentSession(
+        stt=_build_stt(settings),
+        llm=_build_llm(settings, personas[lead]),
+        vad=_build_vad(),
+    )
+
+    accum = _SessionAccumulators(
+        persona=personas[lead],
+        run_context=run_context,
+        session_id=session_id,
+        user_id=user_id,
+    )
+
+    # Turn state. ``current_speaker`` tracks the active Agent; ``last_speaker``
+    # feeds the moderator's anti-repeat rule; ``directed_next`` holds a pending
+    # user-directed target from a ``panel.direct`` data message.
+    state: Dict[str, Optional[str]] = {
+        "current_speaker": lead,
+        "last_speaker": None,
+        "directed_next": None,
+    }
+    last_user_final_at: Dict[str, float] = {"t": 0.0}
+
+    async def _switch_to(agent_id: str) -> None:
+        if agent_id == state["current_speaker"]:
+            return
+        try:
+            await session.update_agent(agents[agent_id])
+            state["current_speaker"] = agent_id
+        except Exception as exc:  # noqa: BLE001 — never crash the call on a swap
+            logger.warning("panel update_agent to %s failed: %s", agent_id, exc)
+
+    async def _on_user_final(text: str) -> None:
+        accum.turn_index += 1
+        last_user_final_at["t"] = time.time()
+        await asyncio.to_thread(
+            _persist_turn,
+            session_id=session_id,
+            idx=accum.turn_index,
+            role="user",
+            text=text,
+            provider="deepgram",
+            model=settings.deepgram_model,
+        )
+        # Route this turn: directed (from panel.direct) → addressed-by-name →
+        # topic affinity → lead. Then swap the active persona/voice.
+        directed = state["directed_next"]
+        state["directed_next"] = None
+        speaker = panel.select_speaker(
+            text,
+            roster,
+            directed_agent_id=directed,
+            last_speaker=state["last_speaker"],
+        )
+        await _switch_to(speaker)
+        state["last_speaker"] = speaker
+        await _publish_data_event(
+            ctx.room,
+            {"kind": panel.KIND_PANEL_SPEAKER, "agent_id": speaker, "session_id": session_id},
+        )
+        # PM reconcile detection still applies when the PM is on the panel.
+        if speaker == "Portfolio Manager" and detect_reconcile_request(text):
+            await _publish_data_event(
+                ctx.room,
+                {
+                    "kind": KIND_RECONCILE_REQUESTED,
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "objection": text,
+                },
+            )
+        await _publish_data_event(
+            ctx.room,
+            {"kind": KIND_TRANSCRIPT_FINAL, "role": "user", "text": text, "idx": accum.turn_index},
+        )
+
+    async def _on_assistant_final(text: str) -> None:
+        accum.turn_index += 1
+        speaker = state["current_speaker"]
+        if last_user_final_at["t"]:
+            rtt_ms = int((time.time() - last_user_final_at["t"]) * 1000.0)
+            await _publish_data_event(
+                ctx.room,
+                {"kind": KIND_USAGE, "session_id": session_id, "rtt_ms": rtt_ms, "turn": accum.turn_index},
+            )
+            last_user_final_at["t"] = 0.0
+        await asyncio.to_thread(
+            _persist_turn,
+            session_id=session_id,
+            idx=accum.turn_index,
+            role="assistant",
+            text=text,
+            provider=settings.tts_provider,
+            model=settings.elevenlabs_model
+            if settings.tts_provider == "elevenlabs"
+            else "cartesia-sonic",
+            speaker_agent_id=speaker,
+        )
+        # Attribute the assistant transcript to the persona that spoke it.
+        await _publish_data_event(
+            ctx.room,
+            {
+                "kind": KIND_TRANSCRIPT_FINAL,
+                "role": "assistant",
+                "text": text,
+                "idx": accum.turn_index,
+                "agent_id": speaker,
+            },
+        )
+
+    @session.on("user_input_transcribed")
+    def _wrap_user(ev: Any) -> None:  # noqa: ANN401 — vendor type
+        text = getattr(ev, "transcript", None) or getattr(ev, "text", "")
+        if not getattr(ev, "is_final", True):
+            asyncio.create_task(
+                _publish_data_event(
+                    ctx.room,
+                    {"kind": KIND_TRANSCRIPT_PARTIAL, "role": "user", "text": text},
+                )
+            )
+            return
+        asyncio.create_task(_on_user_final(text))
+
+    @session.on("conversation_item_added")
+    def _wrap_assistant(ev: Any) -> None:  # noqa: ANN401
+        item = getattr(ev, "item", None)
+        if item is None or getattr(item, "role", None) != "assistant":
+            return
+        content = getattr(item, "text_content", None) or getattr(item, "content", "")
+        if not content:
+            return
+        asyncio.create_task(_on_assistant_final(content))
+
+    # Inbound user-directed routing: the client publishes {kind:"panel.direct",
+    # agent_id:...} when the user taps a panelist. We honor it on the next turn.
+    @ctx.room.on("data_received")
+    def _on_data(packet: Any) -> None:  # noqa: ANN401 — vendor type
+        try:
+            raw = getattr(packet, "data", None)
+            if raw is None:
+                return
+            payload = json.loads(bytes(raw).decode("utf-8"))
+        except Exception:  # noqa: BLE001 — ignore malformed inbound data
+            return
+        if payload.get("kind") == panel.KIND_PANEL_DIRECT:
+            target = payload.get("agent_id")
+            if target in roster:
+                state["directed_next"] = target
+
+    async def _terminate_after_max() -> None:
+        await asyncio.sleep(max(60, settings.session_max_seconds))
+        logger.info("voice panel %s hit max duration; disconnecting", session_id)
+        try:
+            await session.aclose()
+        finally:
+            await ctx.shutdown(reason="max-duration-reached")
+
+    asyncio.create_task(_terminate_after_max())
+
+    logger.info(
+        "voice panel start: session=%s roster=%s lead=%s run=%s",
+        session_id, roster, lead, run_id,
+    )
+    # Start on the lead agent so the moderator greets first.
+    await session.start(agent=agents[lead], room=ctx.room)
+    try:
+        await session.generate_reply(
+            instructions=(
+                f"You are {personas[lead].display_name}, opening a panel with "
+                f"{', '.join(roster_display)}. In one sentence, welcome the user "
+                "and invite their first question to the panel."
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — opener failure is non-fatal
+        logger.warning("voice panel opener failed: %s", exc)
+
+    try:
+        await session.aclose_event.wait()
+    except AttributeError:
+        await ctx.room.wait_for_disconnect() if hasattr(ctx.room, "wait_for_disconnect") else None
+
+    elapsed = max(0.0, time.time() - accum.started_at)
+    accum.input_audio_seconds = elapsed * 0.4
+    accum.output_audio_seconds = elapsed * 0.6
+    cost_usd = _estimate_cost(accum, pricing)
+    await asyncio.to_thread(
+        _finalize_session,
+        session_id=session_id,
+        status="completed",
+        input_audio_seconds=accum.input_audio_seconds,
+        output_audio_seconds=accum.output_audio_seconds,
+        input_tokens=accum.input_tokens,
+        output_tokens=accum.output_tokens,
+        cost_usd=cost_usd,
+    )
+    logger.info("voice panel end: session=%s elapsed=%.1fs cost=$%.4f", session_id, elapsed, cost_usd)
+
+
 async def entrypoint(ctx: Any) -> None:
     """LiveKit Agents JobContext entrypoint.
 
@@ -265,6 +538,12 @@ async def entrypoint(ctx: Any) -> None:
         metadata = json.loads(raw_metadata)
     except json.JSONDecodeError:
         logger.error("voice room has invalid metadata: %r", raw_metadata)
+        return
+
+    # Panel calls (mode="panel") host several personas in one room and run the
+    # moderated multi-agent loop instead of the single-persona path below.
+    if metadata.get("mode") == "panel":
+        await _run_panel_session(ctx, settings, pricing, metadata)
         return
 
     agent_id = metadata.get("agent_id")

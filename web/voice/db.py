@@ -97,6 +97,57 @@ def create_session(
         return False
 
 
+def create_panel_session(
+    *,
+    session_id: str,
+    run_id: str,
+    agent_ids: List[str],
+    lead_agent_id: str,
+    user_id: Optional[str],
+    livekit_room: str,
+    tts_provider: str,
+    asr_provider: str,
+    llm_provider: Optional[str],
+    llm_model: Optional[str],
+) -> bool:
+    """Insert a panel ``voice_sessions`` row (``mode='panel'``).
+
+    The scalar ``agent_id`` column stores the lead (moderator) so the cost
+    dashboard and per-agent queries keep working unchanged; ``agent_ids`` holds
+    the full roster. Fail-open like :func:`create_session`: a missing ``mode`` /
+    ``agent_ids`` column (un-migrated schema) is tolerated because we drop those
+    keys and retry once as a plain solo-shaped row.
+    """
+    client = _client()
+    if client is None:
+        return False
+    base = {
+        "id": session_id,
+        "run_id": run_id,
+        "agent_id": lead_agent_id,
+        "user_id": user_id,
+        "livekit_room": livekit_room,
+        "status": "started",
+        "tts_provider": tts_provider,
+        "asr_provider": asr_provider,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+        "started_at": _now_iso(),
+    }
+    row = {**base, "mode": "panel", "agent_ids": list(agent_ids)}
+    try:
+        client.table("voice_sessions").upsert(row, on_conflict="id").execute()
+        return True
+    except Exception as exc:  # noqa: BLE001 — retry without panel columns
+        logger.warning("voice create_panel_session (panel cols) failed: %s", exc)
+        try:
+            client.table("voice_sessions").upsert(base, on_conflict="id").execute()
+            return True
+        except Exception as exc2:  # noqa: BLE001 — fail-open
+            logger.warning("voice create_panel_session fallback failed: %s", exc2)
+            return False
+
+
 def finish_session(
     session_id: str,
     *,
@@ -141,8 +192,14 @@ def append_turn(
     ended_at: Optional[datetime] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    speaker_agent_id: Optional[str] = None,
 ) -> bool:
-    """Insert one finalized ASR or TTS turn into ``voice_turns``."""
+    """Insert one finalized ASR or TTS turn into ``voice_turns``.
+
+    ``speaker_agent_id`` attributes an assistant turn to the persona that spoke
+    it (panel mode). It is only sent when provided *and* only re-tried without
+    the column on failure, so an un-migrated schema still records the turn.
+    """
     client = _client()
     if client is None:
         return False
@@ -158,10 +215,20 @@ def append_turn(
         row["started_at"] = started_at.isoformat()
     if ended_at:
         row["ended_at"] = ended_at.isoformat()
+    if speaker_agent_id:
+        row["speaker_agent_id"] = speaker_agent_id
     try:
         client.table("voice_turns").insert(row).execute()
         return True
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — retry without the panel column
+        if speaker_agent_id:
+            row.pop("speaker_agent_id", None)
+            try:
+                client.table("voice_turns").insert(row).execute()
+                return True
+            except Exception as exc2:  # noqa: BLE001
+                logger.warning("voice append_turn fallback failed: %s", exc2)
+                return False
         logger.warning("voice append_turn failed: %s", exc)
         return False
 
@@ -183,13 +250,24 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
         if not rows:
             return None
         session = rows[0]
-        tres = (
-            client.table("voice_turns")
-            .select("idx,role,text,started_at,ended_at")
-            .eq("session_id", session_id)
-            .order("idx")
-            .execute()
-        )
+        # Prefer the panel-attributed columns; fall back to the base set on an
+        # un-migrated schema so the session still loads (fail-open).
+        try:
+            tres = (
+                client.table("voice_turns")
+                .select("idx,role,text,started_at,ended_at,speaker_agent_id")
+                .eq("session_id", session_id)
+                .order("idx")
+                .execute()
+            )
+        except Exception:  # noqa: BLE001 — speaker_agent_id column may be absent
+            tres = (
+                client.table("voice_turns")
+                .select("idx,role,text,started_at,ended_at")
+                .eq("session_id", session_id)
+                .order("idx")
+                .execute()
+            )
         session["turns"] = tres.data or []
         return session
     except Exception as exc:  # noqa: BLE001

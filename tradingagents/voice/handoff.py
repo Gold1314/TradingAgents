@@ -30,6 +30,14 @@ KIND_TRANSCRIPT_PARTIAL = "transcript.partial"
 KIND_TRANSCRIPT_FINAL = "transcript.final"
 KIND_USAGE = "usage"
 
+# Panel-call kinds (multi-agent room). Defined in :mod:`tradingagents.voice.panel`
+# and re-exported here so the full data-channel contract is discoverable in one
+# place. ``transcript.*`` payloads additionally carry an ``agent_id`` in panel
+# mode so clients can attribute each turn to the persona that spoke.
+KIND_PANEL_SPEAKER = "panel.speaker"     # server→client: who speaks this turn
+KIND_PANEL_ROSTER = "panel.roster"       # server→client: panelist list at start
+KIND_PANEL_DIRECT = "panel.direct"       # client→server: direct next answer to an agent
+
 
 @dataclass(frozen=True)
 class HandoffSuggested:

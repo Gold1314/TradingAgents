@@ -29,7 +29,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import ModuleType
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
@@ -39,8 +39,13 @@ from tradingagents.voice.context_loader import (
     RunContext,
     load_run_context,
 )
+from tradingagents.voice import panel as voice_panel
 from tradingagents.voice.handoff import detect_reconcile_request
-from tradingagents.voice.personas import VoicePersona, get_persona_for_user
+from tradingagents.voice.personas import (
+    VoicePersona,
+    get_persona,
+    get_persona_for_user,
+)
 from tradingagents.voice.reconcile import run_reconcile
 from tradingagents.voice.settings import VoiceSettings, load_settings
 from web.voice import db as voice_db
@@ -83,6 +88,11 @@ def _try_mobile_auth():
 class VoiceSessionRequest(BaseModel):
     run_id: str
     agent_id: str
+
+
+class PanelSessionRequest(BaseModel):
+    run_id: str
+    agent_ids: List[str]
 
 
 class ReconcileRequest(BaseModel):
@@ -135,6 +145,55 @@ def _ensure_voice_ready(settings: VoiceSettings) -> None:
     ok, reason = settings.fully_configured
     if not ok:
         raise HTTPException(status_code=503, detail=f"voice unavailable: {reason}")
+
+
+async def _enforce_voice_caps(
+    loop, settings: VoiceSettings, user_id: Optional[str]
+) -> None:
+    """Apply the per-user daily-minute and hourly-session caps.
+
+    Shared by the solo (:func:`create_session`) and panel session paths so both
+    honor the same guardrails. Best-effort/fail-open on the DB read; anonymous
+    web callers (no ``user_id``) bypass, as before.
+    """
+    if not user_id:
+        return
+    if settings.daily_minutes_per_user > 0:
+        used = await loop.run_in_executor(
+            None, voice_db.user_voice_minutes_today, user_id
+        )
+        if used >= settings.daily_minutes_per_user:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "voice_minutes_exceeded",
+                    "message": (
+                        f"You've used your daily voice minutes "
+                        f"({settings.daily_minutes_per_user} min / 24h)."
+                    ),
+                    "used_minutes": used,
+                    "limit_minutes": settings.daily_minutes_per_user,
+                },
+            )
+    if settings.hourly_sessions_per_user > 0:
+        since_ts = datetime.now(timezone.utc) - timedelta(hours=1)
+        recent = await loop.run_in_executor(
+            None, voice_db.count_user_sessions_since, user_id, since_ts
+        )
+        if recent >= settings.hourly_sessions_per_user:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "voice_sessions_exceeded",
+                    "message": (
+                        f"You've started too many voice calls this hour "
+                        f"({settings.hourly_sessions_per_user}/hr). "
+                        "Wait a bit and try again."
+                    ),
+                    "used_sessions": recent,
+                    "limit_sessions": settings.hourly_sessions_per_user,
+                },
+            )
 
 
 def _assert_run_owner(
@@ -290,47 +349,9 @@ def build_voice_router(server: ModuleType) -> APIRouter:
 
         loop = asyncio.get_running_loop()
 
-        # Daily minute cap (Phase 6) — best-effort, fail-open.
-        if user_id and settings.daily_minutes_per_user > 0:
-            used = await loop.run_in_executor(
-                None, voice_db.user_voice_minutes_today, user_id
-            )
-            if used >= settings.daily_minutes_per_user:
-                raise HTTPException(
-                    status_code=429,
-                    detail={
-                        "code": "voice_minutes_exceeded",
-                        "message": (
-                            f"You've used your daily voice minutes "
-                            f"({settings.daily_minutes_per_user} min / 24h)."
-                        ),
-                        "used_minutes": used,
-                        "limit_minutes": settings.daily_minutes_per_user,
-                    },
-                )
-
-        # Hourly session cap — defends against rapid-fire reconnects /
-        # accidental loops blowing through the daily minutes via lots of
-        # short calls. Bypass for anonymous web (no user_id to bind to).
-        if settings.hourly_sessions_per_user > 0 and user_id is not None:
-            since_ts = datetime.now(timezone.utc) - timedelta(hours=1)
-            recent = await loop.run_in_executor(
-                None, voice_db.count_user_sessions_since, user_id, since_ts
-            )
-            if recent >= settings.hourly_sessions_per_user:
-                raise HTTPException(
-                    status_code=429,
-                    detail={
-                        "code": "voice_sessions_exceeded",
-                        "message": (
-                            f"You've started too many voice calls this hour "
-                            f"({settings.hourly_sessions_per_user}/hr). "
-                            "Wait a bit and try again."
-                        ),
-                        "used_sessions": recent,
-                        "limit_sessions": settings.hourly_sessions_per_user,
-                    },
-                )
+        # Per-user daily-minute + hourly-session caps (Phase 6). Shared with
+        # the panel path; best-effort/fail-open, anonymous web bypasses.
+        await _enforce_voice_caps(loop, settings, user_id)
 
         # Pull the run's context. Try Supabase, then the in-memory manager.
         ctx = await loop.run_in_executor(
@@ -418,6 +439,125 @@ def build_voice_router(server: ModuleType) -> APIRouter:
             "room": room,
             "persona": _persona_payload(persona),
             "variant": variant,
+            "expires_in": settings.token_ttl_seconds,
+            "session_max_seconds": settings.session_max_seconds,
+        }
+
+    @router.post("/panels")
+    async def create_panel(
+        body: PanelSessionRequest,
+        request: Request,
+        authorization: Optional[str] = Header(default=None),
+    ) -> dict:
+        """Start a *panel* call — several personas in one room (moderated
+        turn-taking). Body: ``{run_id, agent_ids: [...]}``.
+
+        Validates the roster (2..panel_max_agents distinct known agents, each
+        with a finished report on this run), provisions ONE LiveKit room with
+        ``mode="panel"`` metadata, and returns the token + persona roster. The
+        worker reads the mode and runs the multi-agent moderator loop; the
+        moderator lead (first) persona greets.
+        """
+        settings = load_settings()
+        _ensure_voice_ready(settings)
+
+        user_id = _resolve_user_id(request, authorization)
+        _assert_run_owner(server, body.run_id, user_id)
+
+        try:
+            roster = voice_panel.normalize_roster(
+                body.agent_ids, max_agents=settings.panel_max_agents
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        personas = [get_persona(aid) for aid in roster]
+        if any(p is None for p in personas):  # normalize_roster already guards
+            raise HTTPException(status_code=400, detail="unknown agent in roster")
+
+        loop = asyncio.get_running_loop()
+        await _enforce_voice_caps(loop, settings, user_id)
+
+        # Every panelist must have a finished report on this run.
+        ctx = await loop.run_in_executor(
+            None, lambda: load_run_context(body.run_id, server.manager)
+        )
+        for aid in roster:
+            err = _run_completed(ctx, aid)
+            if err is not None:
+                raise HTTPException(status_code=409, detail=err)
+
+        session_id = uuid.uuid4().hex
+        lead = voice_panel.lead_agent(roster)
+        room = f"voice-{body.run_id}-panel-{session_id[:8]}"
+
+        metadata = {
+            "session_id": session_id,
+            "run_id": body.run_id,
+            "mode": "panel",
+            "agent_ids": list(roster),
+            "lead_agent_id": lead,
+            # ``agent_id`` kept for forward-compat with any consumer that only
+            # reads the scalar field; set to the lead/moderator.
+            "agent_id": lead,
+            "user_id": user_id,
+            "ticker": ctx.ticker if ctx else None,
+            "trade_date": ctx.trade_date if ctx else None,
+            "asset_type": ctx.asset_type if ctx else None,
+        }
+
+        try:
+            await livekit_admin.ensure_room(
+                url=settings.livekit_url or "",
+                api_key=settings.livekit_api_key or "",
+                api_secret=settings.livekit_api_secret or "",
+                room=room,
+                metadata=metadata,
+                agent_name=VOICE_AGENT_NAME,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface as 503
+            logger.error("voice panel ensure_room failed: %s", exc)
+            raise HTTPException(
+                status_code=503, detail="could not provision voice room"
+            ) from exc
+
+        try:
+            token = mint_room_token(
+                api_key=settings.livekit_api_key or "",
+                api_secret=settings.livekit_api_secret or "",
+                identity=f"user-{user_id or 'anon'}-{session_id[:6]}",
+                room=room,
+                name=user_id or "user",
+                ttl_seconds=settings.token_ttl_seconds,
+                metadata=metadata,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        await loop.run_in_executor(
+            None,
+            lambda: voice_db.create_panel_session(
+                session_id=session_id,
+                run_id=body.run_id,
+                agent_ids=list(roster),
+                lead_agent_id=lead,
+                user_id=user_id,
+                livekit_room=room,
+                tts_provider=settings.tts_provider,
+                asr_provider="deepgram",
+                llm_provider=settings.voice_llm_provider,
+                llm_model=settings.voice_llm_model,
+            ),
+        )
+
+        return {
+            "session_id": session_id,
+            "url": settings.livekit_url,
+            "token": token,
+            "room": room,
+            "mode": "panel",
+            "lead_agent_id": lead,
+            "personas": [_persona_payload(p) for p in personas],
             "expires_in": settings.token_ttl_seconds,
             "session_max_seconds": settings.session_max_seconds,
         }
