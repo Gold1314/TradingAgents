@@ -120,6 +120,9 @@ export function useVoiceSession(runId: string, agentId: string): VoiceSessionSta
         case 'reconcileRequested':
           setReconcilePrefill(event.objection);
           break;
+        case 'panelSpeaker':
+          // Panel-only signal; solo calls never receive it. Ignored here.
+          break;
         case 'latency': {
           const buf = latencyBufferRef.current;
           buf.push(event.rttMs);

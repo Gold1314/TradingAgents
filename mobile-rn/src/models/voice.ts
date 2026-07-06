@@ -27,6 +27,24 @@ export interface VoiceSessionStartResponse {
   sessionMaxSeconds: number;
 }
 
+/**
+ * Response to `POST /api/voice/panels` — a moderated multi-agent room. Unlike
+ * the solo session, the room hosts a whole roster (order = panel order); one
+ * persona speaks per turn and the `lead_agent_id` opens the call. The
+ * `url`/`token` connect to LiveKit exactly like the solo path.
+ */
+export interface PanelSession {
+  sessionId: string;
+  url: string;
+  token: string;
+  room: string;
+  mode: string;
+  leadAgentId: string;
+  personas: VoicePersonaPayload[];
+  expiresIn: number;
+  sessionMaxSeconds: number;
+}
+
 /** Capability probe (`GET /api/voice/config`) that drives Talk-button visibility. */
 export interface VoiceConfig {
   enabled: boolean;
@@ -44,6 +62,12 @@ export interface VoiceTranscriptEntry {
   role: 'user' | 'assistant' | 'reconcile';
   text: string;
   isPartial: boolean;
+  /**
+   * Panel-only attribution: the speaking persona's `agent_id` for an assistant
+   * row. `null` in solo calls (and for user rows). Populated from the
+   * `agent_id` field on `transcript.final` frames in a panel room.
+   */
+  agentId?: string | null;
 }
 
 /** Handoff target the agent has suggested during a call. */
@@ -100,6 +124,29 @@ export function parseVoiceSessionStartResponse(raw: unknown): VoiceSessionStartR
     expiresIn: asNumber(obj.expires_in) ?? 0,
     sessionMaxSeconds: asNumber(obj.session_max_seconds) ?? 0,
   };
+}
+
+export function parsePanelSession(raw: unknown): PanelSession {
+  const obj = (raw ?? {}) as Json;
+  const rawPersonas = Array.isArray(obj.personas) ? obj.personas : [];
+  return {
+    sessionId: asString(obj.session_id) ?? '',
+    url: asString(obj.url) ?? '',
+    token: asString(obj.token) ?? '',
+    room: asString(obj.room) ?? '',
+    mode: asString(obj.mode) ?? 'panel',
+    leadAgentId: asString(obj.lead_agent_id) ?? '',
+    personas: rawPersonas.map(parseVoicePersona),
+    expiresIn: asNumber(obj.expires_in) ?? 0,
+    sessionMaxSeconds: asNumber(obj.session_max_seconds) ?? 0,
+  };
+}
+
+/** Parse `GET /api/voice/personas` → the full roster for the panel picker. */
+export function parseVoicePersonaList(raw: unknown): VoicePersonaPayload[] {
+  const obj = (raw ?? {}) as Json;
+  const list = Array.isArray(obj.personas) ? obj.personas : [];
+  return list.map(parseVoicePersona);
 }
 
 export function parseVoiceConfig(raw: unknown): VoiceConfig {

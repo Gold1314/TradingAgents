@@ -8,6 +8,7 @@ import { StageStepper } from '../components/StageStepper';
 import { VerdictHero } from '../components/VerdictHero';
 import { Economics } from '../components/Economics';
 import { AgentFeed } from '../components/AgentFeed';
+import { PanelLauncher } from '../components/PanelLauncher';
 import { Banner } from '../components/primitives';
 import { isActionable } from '../models/order';
 import { apiClient } from '../services/apiClient';
@@ -122,6 +123,13 @@ export function RunSessionScreen({ route, navigation }: Props) {
             {`${orderIsLive ? 'Review LIVE' : 'Review'} ${lastTrade.intent.action.toUpperCase()} · ${lastTrade.intent.ticker}`}
           </Text>
         </Pressable>
+      )}
+
+      {runId != null && (
+        <PanelLauncher
+          voiceReady={voiceReady}
+          onStart={(agentIds) => navigation.navigate('PanelCall', { runId, agentIds })}
+        />
       )}
 
       <AgentFeed

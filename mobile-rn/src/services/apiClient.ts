@@ -14,10 +14,14 @@ import {
 import { parseChartPayload, type ChartPayload } from '../models/chart';
 import type { PlaceOrderRequest } from '../models/order';
 import {
+  parsePanelSession,
   parseVoiceConfig,
+  parseVoicePersonaList,
   parseVoiceReconcileResponse,
   parseVoiceSessionStartResponse,
+  type PanelSession,
   type VoiceConfig,
+  type VoicePersonaPayload,
   type VoiceReconcileResponse,
   type VoiceSessionStartResponse,
 } from '../models/voice';
@@ -137,6 +141,31 @@ class ApiClient {
       await this.request('POST', '/api/voice/sessions', {
         run_id: runId,
         agent_id: agentId,
+      }),
+    );
+  }
+
+  /**
+   * `GET /api/voice/personas` — the full (12-agent) persona roster used to
+   * populate the panel multi-select picker. Sanitised server-side (no raw
+   * voice ids). Distinct from `fetchVoiceConfig`, which only gates visibility.
+   */
+  async fetchPersonas(): Promise<VoicePersonaPayload[]> {
+    return parseVoicePersonaList(await this.request('GET', '/api/voice/personas'));
+  }
+
+  /**
+   * `POST /api/voice/panels` — mint a LiveKit room JWT for a *panel* call: a
+   * moderated room with 2..N personas taking turns. Mirrors
+   * `startVoiceSession` but carries a roster (`agent_ids`) instead of a single
+   * agent. Errors map identically (400 bad roster, 409 report not finished,
+   * 429 caps, 503 off) through the shared `request`/`mapHttpError` path.
+   */
+  async startPanelSession(runId: string, agentIds: string[]): Promise<PanelSession> {
+    return parsePanelSession(
+      await this.request('POST', '/api/voice/panels', {
+        run_id: runId,
+        agent_ids: agentIds,
       }),
     );
   }

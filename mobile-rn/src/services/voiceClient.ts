@@ -44,10 +44,14 @@ export type VoiceClientEvent =
       role: 'user' | 'assistant' | 'reconcile';
       text: string;
       isFinal: boolean;
+      /** Panel-only: the speaking persona for assistant finals (else null). */
+      agentId: string | null;
     }
   | { type: 'handoff'; targetAgentId: string; quote: string }
   | { type: 'reconcileRequested'; objection: string }
-  | { type: 'latency'; rttMs: number; turn: number };
+  | { type: 'latency'; rttMs: number; turn: number }
+  /** Panel-only: the active speaker changed — highlight this persona. */
+  | { type: 'panelSpeaker'; agentId: string };
 
 export type VoiceClientListener = (event: VoiceClientEvent) => void;
 
@@ -133,6 +137,23 @@ export class VoiceClient {
     return this.muted;
   }
 
+  /**
+   * Panel-only: direct the next answer to a specific panelist. Publishes
+   * `{kind:"panel.direct",agent_id}` on the reliable data channel from the
+   * local participant. No-op if the room isn't connected yet.
+   */
+  async publishPanelDirect(agentId: string): Promise<void> {
+    if (this.disposed || !this.room) return;
+    const bytes = Uint8Array.from(
+      new TextEncoder().encode(JSON.stringify({ kind: 'panel.direct', agent_id: agentId })),
+    );
+    try {
+      await this.room.localParticipant.publishData(bytes, { reliable: true });
+    } catch (err) {
+      this.emit({ type: 'error', message: `Direct failed: ${describe(err)}` });
+    }
+  }
+
   /** Disconnect, release native audio session, and stop emitting events. */
   async hangup(): Promise<void> {
     if (this.disposed) return;
@@ -196,6 +217,7 @@ export class VoiceClient {
               role: parseRole(json.role),
               text: typeof json.text === 'string' ? json.text : '',
               isFinal: false,
+              agentId: typeof json.agent_id === 'string' ? json.agent_id : null,
             });
             break;
           case 'transcript.final':
@@ -204,8 +226,17 @@ export class VoiceClient {
               role: parseRole(json.role),
               text: typeof json.text === 'string' ? json.text : '',
               isFinal: true,
+              // Panel assistant finals carry the speaking persona so the UI can
+              // attribute the row; solo finals omit it (→ null).
+              agentId: typeof json.agent_id === 'string' ? json.agent_id : null,
             });
             break;
+          case 'panel.speaker': {
+            const speaker = typeof json.agent_id === 'string' ? json.agent_id : '';
+            if (!speaker) break;
+            this.emit({ type: 'panelSpeaker', agentId: speaker });
+            break;
+          }
           case 'handoff.suggested': {
             const target = typeof json.target_agent_id === 'string' ? json.target_agent_id : '';
             if (!target) break;
