@@ -7,13 +7,15 @@ import Foundation
 /// ``done``. Tapping it ``POST``s here, the server returns a LiveKit room
 /// JWT + URL, and the iOS client joins the room via the Swift SDK.
 
-struct VoicePersonaPayload: Decodable, Equatable {
+struct VoicePersonaPayload: Decodable, Equatable, Identifiable {
     let agentID: String
     let displayName: String
     let voiceName: String?
     let shortIntro: String?
     let handoffTargets: [String]
     let toolGrants: [String]
+
+    var id: String { agentID }
 
     enum CodingKeys: String, CodingKey {
         case agentID = "agent_id"
@@ -22,6 +24,20 @@ struct VoicePersonaPayload: Decodable, Equatable {
         case shortIntro = "short_intro"
         case handoffTargets = "handoff_targets"
         case toolGrants = "tool_grants"
+    }
+
+    /// Custom decoder so one persona model serves BOTH sources:
+    /// * `POST /api/voice/panels` personas (carry `tool_grants` + `handoff_targets`)
+    /// * `GET /api/voice/personas` list rows (no `tool_grants`)
+    /// The two absent-on-one-endpoint arrays default to empty rather than failing.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        agentID = try c.decode(String.self, forKey: .agentID)
+        displayName = try c.decode(String.self, forKey: .displayName)
+        voiceName = try c.decodeIfPresent(String.self, forKey: .voiceName)
+        shortIntro = try c.decodeIfPresent(String.self, forKey: .shortIntro)
+        handoffTargets = try c.decodeIfPresent([String].self, forKey: .handoffTargets) ?? []
+        toolGrants = try c.decodeIfPresent([String].self, forKey: .toolGrants) ?? []
     }
 }
 
@@ -72,6 +88,10 @@ struct VoiceTranscriptEntry: Identifiable, Equatable {
     /// True while the ASR/TTS engine is still emitting partials for this row.
     /// We coalesce partials into a single row keyed on role.
     var isPartial: Bool
+    /// PANEL mode only: the persona (display name) who spoke this assistant row,
+    /// carried on `transcript.final` messages. `nil` for solo calls and for user
+    /// rows. Defaulted so the solo-path memberwise initializer is unaffected.
+    var agentID: String? = nil
 }
 
 /// Handoff target the agent suggested during the call.

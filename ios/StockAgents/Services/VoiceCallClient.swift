@@ -23,11 +23,15 @@ actor VoiceCallClient {
         case connected
         case disconnected(reason: String?)
         case error(String)
-        case transcript(role: VoiceTranscriptEntry.Role, text: String, isFinal: Bool)
+        /// `agentID` is non-nil only in PANEL mode on `transcript.final` — the
+        /// persona who spoke this row. Solo calls and partials leave it nil.
+        case transcript(role: VoiceTranscriptEntry.Role, text: String, isFinal: Bool, agentID: String?)
         case handoff(target: String, quote: String)
         case reconcileRequested(objection: String)
         /// Per-turn round-trip ms from the worker's ``usage`` event (Phase 6).
         case latency(rttMillis: Int, turn: Int)
+        /// PANEL mode: the persona about to speak this turn (`panel.speaker`).
+        case panelSpeaker(agentID: String)
     }
 
     private(set) var sessionID: String?
@@ -43,13 +47,25 @@ actor VoiceCallClient {
     private var continuation: AsyncStream<Event>.Continuation?
     let events: AsyncStream<Event>
 
-    init(session: VoiceSessionStartResponse) {
-        self.sessionID = session.sessionID
-        self.url = session.url
-        self.token = session.token
+    /// Designated initializer — works for both solo sessions and panels, since
+    /// the LiveKit connection only needs the room URL + JWT.
+    init(sessionID: String, url: String, token: String) {
+        self.sessionID = sessionID
+        self.url = url
+        self.token = token
         var localCont: AsyncStream<Event>.Continuation!
         self.events = AsyncStream { cont in localCont = cont }
         self.continuation = localCont
+    }
+
+    /// Convenience for the solo path.
+    convenience init(session: VoiceSessionStartResponse) {
+        self.init(sessionID: session.sessionID, url: session.url, token: session.token)
+    }
+
+    /// Convenience for the panel path — the room is joined identically.
+    convenience init(panel: PanelSessionResponse) {
+        self.init(sessionID: panel.sessionID, url: panel.url, token: panel.token)
     }
 
     /// Start the call. Connects to LiveKit, publishes the microphone, and
@@ -99,6 +115,29 @@ actor VoiceCallClient {
         }
         #endif
         return isMuted
+    }
+
+    /// PANEL mode: direct the NEXT user turn to a specific panelist by
+    /// publishing `{ "kind": "panel.direct", "agent_id": <id> }` on the room's
+    /// reliable data channel. No-op on the solo path (the worker ignores it).
+    ///
+    /// LiveKit Swift SDK data-publish API (v2.x): the local participant exposes
+    /// `publish(data:options:)` where `DataPublishOptions(reliable: true)`
+    /// requests the reliable (ordered, retransmitted) channel. Isolated here so
+    /// the one unverified SDK signature lives in a single place — see the report.
+    func directPanel(agentID: String) async {
+        let payload: [String: Any] = ["kind": "panel.direct", "agent_id": agentID]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        #if canImport(LiveKit)
+        do {
+            try await room?.localParticipant.publish(
+                data: data,
+                options: DataPublishOptions(reliable: true)
+            )
+        } catch {
+            emit(.error("Direct failed: \(error.localizedDescription)"))
+        }
+        #endif
     }
 
     /// Disconnect and release the room. Idempotent.
@@ -165,14 +204,24 @@ private final class DataDelegate: NSObject, RoomDelegate, Sendable {
             onEvent(.transcript(
                 role: parseRole(json["role"]),
                 text: json["text"] as? String ?? "",
-                isFinal: false
+                isFinal: false,
+                agentID: nil
             ))
         case "transcript.final":
+            // In PANEL mode, assistant finals carry `agent_id` = the persona who
+            // spoke. Attribute the transcript row to that persona.
             onEvent(.transcript(
                 role: parseRole(json["role"]),
                 text: json["text"] as? String ?? "",
-                isFinal: true
+                isFinal: true,
+                agentID: json["agent_id"] as? String
             ))
+        case "panel.speaker":
+            // NEW: whoever is about to speak this turn → highlight as active.
+            let agentID = json["agent_id"] as? String ?? ""
+            if !agentID.isEmpty {
+                onEvent(.panelSpeaker(agentID: agentID))
+            }
         case "reconcile.requested":
             onEvent(.reconcileRequested(objection: json["objection"] as? String ?? ""))
         case "usage":

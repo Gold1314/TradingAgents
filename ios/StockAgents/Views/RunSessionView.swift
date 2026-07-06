@@ -13,6 +13,8 @@ struct RunSessionView: View {
     @State private var showOrderTicket = false
     @State private var voiceReady = false
     @State private var voiceAgentID: String?
+    @State private var showPanelPicker = false
+    @State private var panelSelection: PanelSelection?
 
     var body: some View {
         ScrollView {
@@ -59,6 +61,19 @@ struct RunSessionView: View {
         .navigationTitle(navigationTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            // "Round table" — start a moderated multi-agent PANEL. Shown only
+            // once voice is configured and at least two agents have finished
+            // (the panel needs 2..N finished reports; the server 409s otherwise).
+            if voiceReady, viewModel.runID != nil, finishedAgents.count >= 2 {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        showPanelPicker = true
+                    } label: {
+                        Image(systemName: "person.3.sequence.fill")
+                    }
+                    .accessibilityLabel("Start a panel")
+                }
+            }
             ToolbarItem(placement: .navigationBarTrailing) {
                 Button("New run", action: onNewRun)
             }
@@ -105,6 +120,31 @@ struct RunSessionView: View {
                 }
             )
         }
+        .sheet(isPresented: $showPanelPicker) {
+            PanelSetupSheet(finishedAgents: finishedAgents) { agentIDs in
+                // Dismiss the picker, then present the call after a one-cycle
+                // gap so the first sheet fully tears down before the second.
+                showPanelPicker = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    panelSelection = PanelSelection(agentIDs: agentIDs)
+                }
+            }
+        }
+        .sheet(item: $panelSelection) { selection in
+            PanelCallView(
+                viewModel: PanelCallViewModel(
+                    runID: viewModel.runID ?? "",
+                    agentIDs: selection.agentIDs,
+                    api: env.api
+                )
+            )
+        }
+    }
+
+    /// Finished agents (report `done`) in pipeline order — the roster the panel
+    /// picker offers. Reuses the same `done`-gating the solo Talk buttons apply.
+    private var finishedAgents: [String] {
+        viewModel.orderedAgents.filter { $0.status == .done }.map { $0.node }
     }
 
     /// Reshape `voiceAgentID` into a `Binding<Identifiable?>` so SwiftUI's
@@ -233,6 +273,12 @@ struct RunSessionView: View {
 private struct VoiceAgentSelection: Identifiable {
     let agentID: String
     var id: String { agentID }
+}
+
+/// Identifiable wrapper so the chosen panel roster can drive `sheet(item:)`.
+private struct PanelSelection: Identifiable {
+    let agentIDs: [String]
+    var id: String { agentIDs.joined(separator: "|") }
 }
 
 /// Tiny elapsed-time chip that ticks once a second while a run streams.

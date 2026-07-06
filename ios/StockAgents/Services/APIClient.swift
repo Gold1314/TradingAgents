@@ -112,6 +112,24 @@ final class APIClient {
         return try await post("/api/voice/sessions", body: body)
     }
 
+    /// `GET /api/voice/personas` — the full persona roster the panel picker
+    /// draws from. Returns `{ "personas": [...] }`.
+    func fetchPersonas() async throws -> [VoicePersonaPayload] {
+        let response: VoicePersonaListResponse = try await get("/api/voice/personas")
+        return response.personas
+    }
+
+    /// `POST /api/voice/panels` — mint a LiveKit room JWT for a moderated
+    /// multi-agent PANEL on the finished run `runID`. The body is
+    /// `{run_id, agent_ids}` with 2..N distinct agent display names. The server
+    /// gates on every agent's report being `done` (409 otherwise), the roster
+    /// being valid (400), rate caps (429), and voice being enabled (503) —
+    /// mapped like the solo path via ``APIError``.
+    func startPanelSession(runID: String, agentIDs: [String]) async throws -> PanelSessionResponse {
+        let body = PanelSessionRequest(runID: runID, agentIDs: agentIDs)
+        return try await post("/api/voice/panels", body: body)
+    }
+
     /// `POST /api/voice/sessions/{id}/reconcile` — Portfolio Manager only.
     /// Submits the user's objection and returns the (possibly flipped)
     /// updated rationale. Never re-runs the pipeline; one focused LLM call.

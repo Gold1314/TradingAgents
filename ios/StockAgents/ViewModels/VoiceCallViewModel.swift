@@ -155,8 +155,11 @@ final class VoiceCallViewModel: ObservableObject {
         case .error(let message):
             phase = .failed(message)
             status = message
-        case .transcript(let role, let text, let isFinal):
+        case .transcript(let role, let text, let isFinal, _):
+            // Solo path ignores the panel-only `agentID`.
             appendTranscript(role: role, text: text, isFinal: isFinal)
+        case .panelSpeaker:
+            break // panel-only; irrelevant to a solo call
         case .handoff(let target, let quote):
             if !handoffs.contains(where: { $0.targetAgentID == target }) {
                 handoffs.append(VoiceHandoff(targetAgentID: target, quote: quote))
