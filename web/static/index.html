@@ -305,6 +305,10 @@ const NODE = {
   "Neutral Analyst":      { stage: "Risk Debate", icon: "⚖️", color: "#94a3b8", blurb: "Balanced view" },
   "Portfolio Manager":    { stage: "Decision", icon: "🎯", color: "#34d399", blurb: "Final call" },
 };
+// Expose the agent icon/color map so the (separately loaded) voice client can
+// reuse the same per-agent icon + accent color for the panel roster strip and
+// attributed transcript lines.
+window.AGENT_META = NODE;
 const RATING_POS = { Sell:0, Underweight:25, Hold:50, Overweight:75, Buy:100 };
 const RATING_COLOR = { Sell:"#f43f5e", Underweight:"#fb923c", Hold:"#94a3b8", Overweight:"#4ade80", Buy:"#10b981" };
 
@@ -341,6 +345,7 @@ let marketChartEl = null;  // chart container kept for PDF export
 let chartCleanups = [];    // teardown fns for ResizeObservers + chart instances
 let usageByNode = {}, usageTotals = null;  // run economics (tokens + est. cost)
 let activeRunId = null;  // current run id, mirrored into blueprint links for live watch
+let finishedAgents = new Set();  // agents whose report is complete → eligible for a voice panel
 const SESSION_KEY = "stockagents_active_run";
 
 // ── analytics: anonymous visitor/session identity + event tracking ──────────
@@ -847,6 +852,10 @@ function updateCard(node,{status,content}){
     // Reveal the "Talk to this agent" button once the agent's report is on
     // screen — voice is only allowed against a finished agent.
     maybeShowTalk(talkBtn);
+    // Record the finished agent and (re)evaluate whether the panel / round-table
+    // affordance should appear (needs ≥2 finished agents + voice enabled).
+    finishedAgents.add(node);
+    maybeShowPanelButton();
   }
 }
 
@@ -881,6 +890,101 @@ async function startVoiceCall(node, card){
   } finally {
     if(btn){ btn.disabled = false; btn.classList.remove("opacity-50"); }
   }
+}
+
+// ── Panel / round-table glue ───────────────────────────────────────────────
+// A floating "Round table" affordance appears once ≥2 agents on the current run
+// have finished (and voice is enabled). Clicking it opens a multi-select of the
+// finished agents; picking ≥2 starts a moderated voice panel.
+let _panelBtnEl = null;
+function ensurePanelButton(){
+  if(_panelBtnEl) return _panelBtnEl;
+  const b=document.createElement("button");
+  b.id="round-table-btn"; b.type="button";
+  b.className="hidden fixed bottom-4 left-4 z-40 flex items-center gap-2 text-xs font-semibold "+
+    "px-3.5 py-2 rounded-full border border-emerald-500/50 bg-slate-950/90 backdrop-blur "+
+    "text-emerald-200 hover:bg-emerald-500/15 hover:border-emerald-400 transition shadow-lg shadow-black/40";
+  // Static markup only (no server/LLM strings).
+  b.innerHTML=`<span style="font-size:14px;line-height:1">👥</span>Round table`;
+  b.onclick=openPanelPicker;
+  document.body.appendChild(b);
+  _panelBtnEl=b; return b;
+}
+async function maybeShowPanelButton(){
+  const b=ensurePanelButton();
+  const ready = await voiceReady();
+  if(ready && activeRunId && finishedAgents.size>=2 && window.VoiceClient && window.VoiceClient.startPanel){
+    b.classList.remove("hidden");
+  } else {
+    b.classList.add("hidden");
+  }
+}
+
+let _panelPicker=null;
+function closePanelPicker(){
+  if(_panelPicker){ _panelPicker.classList.add("hidden"); _panelPicker.classList.remove("flex"); }
+}
+function openPanelPicker(){
+  if(!activeRunId || !window.VoiceClient || !window.VoiceClient.startPanel) return;
+  const agents = Array.from(finishedAgents);
+  if(agents.length<2) return;
+  let modal=_panelPicker;
+  if(!modal){
+    modal=document.createElement("div");
+    modal.id="panel-picker";
+    modal.className="fixed inset-0 z-[60] hidden items-center justify-center bg-black/60 backdrop-blur-sm p-4";
+    // Static markup only; the agent list below is built with DOM APIs + textContent.
+    modal.innerHTML=`
+      <div class="w-[420px] max-w-[94vw] bg-slate-950 border border-slate-700 rounded-2xl shadow-2xl shadow-black/60 overflow-hidden">
+        <div class="flex items-center gap-2 px-4 py-3 border-b border-slate-800">
+          <span style="font-size:16px;line-height:1">👥</span>
+          <div class="font-semibold text-slate-100 flex-1">Round table</div>
+          <button data-close type="button" class="w-7 h-7 rounded-full border border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-500">✕</button>
+        </div>
+        <div class="px-4 py-3 text-xs text-slate-400">Pick two or more finished agents for a moderated voice panel. One agent speaks per turn; click a panelist mid-call to direct the next answer.</div>
+        <div data-list class="px-4 pb-2 space-y-1 max-h-[42vh] overflow-y-auto"></div>
+        <div data-err class="hidden px-4 pb-1 text-xs" style="color:#fb7185"></div>
+        <div class="flex justify-end gap-2 px-4 py-3 border-t border-slate-800">
+          <button data-cancel type="button" class="text-xs px-3 py-1.5 rounded-lg border border-slate-700 text-slate-300 hover:border-slate-500">Cancel</button>
+          <button data-start type="button" class="text-xs px-3 py-1.5 rounded-lg bg-emerald-500/20 border border-emerald-500/50 text-emerald-200 hover:bg-emerald-500/30">Start panel</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    modal.addEventListener("click",(e)=>{ if(e.target===modal) closePanelPicker(); });
+    modal.querySelector("[data-close]").onclick=closePanelPicker;
+    modal.querySelector("[data-cancel]").onclick=closePanelPicker;
+    _panelPicker=modal;
+  }
+  const list=modal.querySelector("[data-list]");
+  const err=modal.querySelector("[data-err]");
+  err.classList.add("hidden"); err.textContent="";
+  list.innerHTML="";
+  agents.forEach(name=>{
+    const meta=NODE[name]||{color:"#94a3b8",icon:"🎙"};
+    const lab=document.createElement("label");
+    lab.className="flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-slate-900 cursor-pointer text-sm text-slate-200";
+    const cb=document.createElement("input");
+    cb.type="checkbox"; cb.value=name; cb.checked=true; cb.className="accent-emerald-500";
+    const ic=document.createElement("span"); ic.textContent=meta.icon||"🎙"; ic.style.color=meta.color;
+    const nm=document.createElement("span"); nm.textContent=name;   // agent display name via textContent (no HTML injection)
+    lab.appendChild(cb); lab.appendChild(ic); lab.appendChild(nm);
+    list.appendChild(lab);
+  });
+  const startBtn=modal.querySelector("[data-start]");
+  startBtn.onclick=async ()=>{
+    const ids=Array.from(list.querySelectorAll("input[type=checkbox]:checked")).map(c=>c.value);
+    if(ids.length<2){ err.textContent="Select at least two agents."; err.classList.remove("hidden"); return; }
+    startBtn.disabled=true; startBtn.classList.add("opacity-50");
+    try {
+      await window.VoiceClient.startPanel(activeRunId, ids);
+      closePanelPicker();
+    } catch(e){
+      err.textContent = e.message || "Panel failed to start."; err.classList.remove("hidden");
+    } finally {
+      startBtn.disabled=false; startBtn.classList.remove("opacity-50");
+    }
+  };
+  modal.classList.remove("hidden"); modal.classList.add("flex");
 }
 
 // ── price chart (Market Analyst) ────────────────────────────────────────────
@@ -1086,6 +1190,7 @@ function resetUI(){
   $("verdict-rationale").classList.add("hidden"); $("verdict-toggle").style.display="none"; $("verdict-toggle").classList.remove("attention-pulse");
   $("cache-banner").classList.add("hidden"); $("cache-banner").style.display="none";
   cardEls={}; sectionEls={}; marketChartEl=null; $("empty").classList.add("hidden");
+  finishedAgents.clear(); closePanelPicker(); if(_panelBtnEl) _panelBtnEl.classList.add("hidden");
   $("download-pdf").classList.add("hidden");
   usageByNode={}; usageTotals=null; $("economics").classList.add("hidden");
   pendingProposal=null;  // clear stale trade proposal so it can't leak into the next run
@@ -1116,6 +1221,7 @@ function renderCached(run){
   nodes.forEach(n=>setNodeState(n,"done"));
   if(run.identity){ $("identity").classList.remove("hidden"); $("identity").textContent=run.identity; }
   agents.forEach(a=>updateCard(a.agent,{status:"done",content:a.content}));
+  maybeShowPanelButton();
   $("verdict").classList.remove("hidden");
   showVerdict(run.decision||"Hold", run.final_content||"");
   showCacheBanner(run.created_at);
@@ -1127,6 +1233,7 @@ $("new-run").onclick=()=>{
   clearActiveRun();
   activeRunId=null;
   updateBlueprintLinks();
+  finishedAgents.clear(); closePanelPicker(); if(_panelBtnEl) _panelBtnEl.classList.add("hidden");
   delete $("run-btn").dataset.finished;
   if(activeES) activeES.close();
   $("run-form").classList.remove("hidden");
