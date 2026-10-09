@@ -23,6 +23,7 @@ human-readable reason) — see :meth:`VoiceSettings.fully_configured`.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import uuid
@@ -96,7 +97,7 @@ def _require_admin(password: Optional[str]) -> None:
     pw = _admin_password()
     if not pw:
         raise HTTPException(status_code=503, detail="admin features are not configured")
-    if password != pw:
+    if not password or not hmac.compare_digest(password.encode(), pw.encode()):
         raise HTTPException(status_code=401, detail="invalid admin password")
 
 

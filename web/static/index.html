@@ -533,7 +533,7 @@ async function loadAccount(open){
   $("account-summary").textContent="";
   $("account-body").innerHTML=`<span class="text-slate-500">Loading account…</span>`;
   try{
-    const res=await fetch("/api/robinhood/account");
+    const res=await fetch("/api/robinhood/account",{headers:{"X-Admin-Password":adminPw}});
     const a=await res.json();
     if(!res.ok || a.connected===false){
       $("account-body").innerHTML=`<span class="text-amber-300">${(a&&(a.detail||a.message))||"Robinhood not connected."}</span>`;
@@ -602,7 +602,7 @@ async function connectRobinhood(){
   const btn=$("rh-btn"); const prev=btn.innerHTML;
   rhBadge(false,"Robinhood · authorizing…"); btn.disabled=true;
   try{
-    const res=await fetch("/api/robinhood/connect",{method:"POST"});
+    const res=await fetch("/api/robinhood/connect",{method:"POST",headers:{"X-Admin-Password":adminPw}});
     const st=await res.json();
     if(!res.ok){ rhBadge(false,"Robinhood · failed"); alert((st&&st.detail)||"Connect failed"); }
     else{ rhConfig=st; Analytics.track("robinhood_connect",{connected:!!st.connected}); if(st.connected){ rhBadge(true, rhBadgeLabel(st)); } else { rhBadge(false,"Robinhood · connect"); if(st.error) alert(st.error); } }
@@ -702,7 +702,7 @@ async function placeProposedOrder(ev){
   const place=host.querySelector("#ord-place"), stat=host.querySelector("#ord-status");
   if(place) place.disabled=true; if(stat) stat.textContent="placing…";
   try{
-    const res=await fetch(`/api/robinhood/orders/${activeRunId}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(edits)});
+    const res=await fetch(`/api/robinhood/orders/${activeRunId}`,{method:"POST",headers:{"Content-Type":"application/json","X-Admin-Password":adminPw},body:JSON.stringify(edits)});
     const data=await res.json();
     if(!res.ok){ showTrade({status:"error",message:(data.detail||"placement failed"),intent:ev.intent,can_place_real_orders:ev.can_place_real_orders,dry_run:ev.dry_run}); }
     else { showTrade(data); }

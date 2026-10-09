@@ -29,7 +29,6 @@ import os
 import re
 import threading
 import time
-import traceback
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -51,6 +50,7 @@ from tradingagents.brokers import (
     load_robinhood_config,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.graph import jev_gate
 from tradingagents.graph.checkpointer import clear_checkpoint, thread_id
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from web import db
@@ -129,6 +129,10 @@ class RunRequest(BaseModel):
     force: bool = False  # bypass the 60-minute cache ("Run fresh anyway")
 
 
+# RunRequest fields that change LLM cost; honored only for the operator.
+_OVERRIDE_FIELDS = ("provider", "deep_model", "quick_model", "max_debate_rounds", "max_risk_rounds")
+
+
 class CacheToggle(BaseModel):
     enabled: bool
 
@@ -166,6 +170,8 @@ class Run:
     order_lock: threading.Lock = field(default_factory=threading.Lock)
     # Requester analytics context (visitor/session/geo/device) for outcome events.
     analytics: Optional[dict] = None
+    # Only operator-started runs may touch the operator's shared Robinhood broker.
+    owner: bool = False
 
 
 class RunManager:
@@ -444,7 +450,7 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
         # blocks or fails the run; a broker hiccup just means no grounding.
         rh_cfg = load_robinhood_config(config)
         account_snapshot = None
-        if rh_cfg.enabled and (rh_cfg.grounding_enabled or rh_cfg.executes_orders):
+        if run.owner and rh_cfg.enabled and (rh_cfg.grounding_enabled or rh_cfg.executes_orders):
             try:
                 broker = get_broker()
                 if not broker.is_connected and broker.has_saved_credentials():
@@ -582,7 +588,8 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
         final_state = {**init_state, **merged}
         decision = ta.process_signal(final_state.get("final_trade_decision", ""))
 
-        # Persist exactly like _run_graph does (logs + pending memory entry).
+        # Persist exactly like _run_graph does (Jev shadow + logs + pending memory entry).
+        final_state["jev_assessment"] = jev_gate.assess(final_state)
         try:
             ta._log_state(req.trade_date, final_state)
             ta.memory_log.store_decision(
@@ -655,7 +662,7 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
         # *proposes* the order (the UI places it on a button click); in "auto"
         # mode it places immediately. dry_run simulates in either case; a real
         # order needs trade_mode in {manual,auto} AND dry_run=False.
-        if rh_cfg.executes_orders:
+        if run.owner and rh_cfg.executes_orders:
             try:
                 broker = get_broker()
                 if broker.is_connected:
@@ -695,7 +702,7 @@ def _run_pipeline(run: Run, req: RunRequest) -> None:
         logger.exception("run failed")
         manager.emit(
             run,
-            {"type": "error", "message": str(exc), "trace": traceback.format_exc()},
+            {"type": "error", "message": str(exc)},
         )
         db.store_event(
             {
@@ -741,7 +748,7 @@ def _blueprint_secret() -> Optional[str]:
 def _mint_blueprint_token(email: str, secret: str, ttl: int = BLUEPRINT_TOKEN_TTL) -> str:
     exp = int(time.time()) + ttl
     msg = f"{email}|{exp}"
-    sig = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    sig = hmac.new(secret.encode(), f"blueprint|{msg}".encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(f"{msg}|{sig}".encode()).decode()
 
 
@@ -752,7 +759,7 @@ def _verify_blueprint_token(token: str, secret: str) -> Optional[str]:
     try:
         raw = base64.urlsafe_b64decode(token.encode()).decode()
         email, exp, sig = raw.rsplit("|", 2)
-        expected = hmac.new(secret.encode(), f"{email}|{exp}".encode(), hashlib.sha256).hexdigest()
+        expected = hmac.new(secret.encode(), f"blueprint|{email}|{exp}".encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected):
             return None
         if int(exp) < int(time.time()):
@@ -861,12 +868,13 @@ async def robinhood_status() -> dict:
 
 
 @app.post("/api/robinhood/connect")
-async def robinhood_connect() -> dict:
+async def robinhood_connect(x_admin_password: Optional[str] = Header(default=None)) -> dict:
     """Authorize the Robinhood MCP (opens a browser for OAuth on first use).
 
     Blocking OAuth/handshake work runs in the thread pool so the event loop
     stays responsive. Returns the resulting status (never raises on auth
     failure — the error is reported in the payload)."""
+    _require_admin(x_admin_password)
     cfg = load_robinhood_config(DEFAULT_CONFIG)
     if not cfg.enabled:
         raise HTTPException(
@@ -903,12 +911,13 @@ def _account_payload() -> dict:
 
 
 @app.get("/api/robinhood/account")
-async def robinhood_account() -> dict:
+async def robinhood_account(x_admin_password: Optional[str] = Header(default=None)) -> dict:
     """Live account snapshot — buying power, portfolio value, positions.
 
     Read-only (never places an order). Returns ``{connected: false, ...}``
     instead of raising when the broker isn't authorized yet. Blocking broker
     work runs in the thread pool."""
+    _require_admin(x_admin_password)
     cfg = load_robinhood_config(DEFAULT_CONFIG)
     if not cfg.enabled:
         raise HTTPException(
@@ -920,11 +929,14 @@ async def robinhood_account() -> dict:
 
 
 @app.post("/api/robinhood/orders/{run_id}")
-async def place_order(run_id: str, body: PlaceOrderRequest) -> dict:
+async def place_order(
+    run_id: str, body: PlaceOrderRequest, x_admin_password: Optional[str] = Header(default=None)
+) -> dict:
     """Place the order proposed by a finished run (manual mode, button click).
 
     Applies optional ticket edits, re-clamps server-side, honors dry_run, and is
     idempotent. Blocking broker work runs in the thread pool."""
+    _require_admin(x_admin_password)
     cfg = load_robinhood_config(DEFAULT_CONFIG)
     if not cfg.enabled or cfg.trade_mode == "off":
         raise HTTPException(status_code=409, detail="Robinhood execution is off.")
@@ -1166,7 +1178,7 @@ def _is_owner(password: Optional[str]) -> bool:
     """
     if not ADMIN_PASSWORD:
         return False
-    return bool(password) and hmac.compare_digest(password, ADMIN_PASSWORD)
+    return bool(password) and hmac.compare_digest(password.encode(), ADMIN_PASSWORD.encode())
 
 
 def _quota_state(client_meta: Dict[str, Any], owner: bool) -> Dict[str, Any]:
@@ -1180,11 +1192,15 @@ def _quota_state(client_meta: Dict[str, Any], owner: bool) -> Dict[str, Any]:
             "owner": owner,
             "allowed": True,
         }
-    used = db.count_quota_consumed(
-        client_meta.get("visitor_id"),
-        client_meta.get("ip_address"),
-        hours=RUN_LIMIT_WINDOW_HOURS,
-    )
+    try:
+        used = db.count_quota_consumed(
+            client_meta.get("visitor_id"),
+            client_meta.get("ip_address"),
+            hours=RUN_LIMIT_WINDOW_HOURS,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail closed: an outage must not mean free runs
+        logger.warning("quota lookup failed, denying run: %s", exc)
+        used = RUN_LIMIT_PER_USER
     return {
         "limit": RUN_LIMIT_PER_USER,
         "used": used,
@@ -1218,7 +1234,8 @@ async def start_run(
     request: Request,
     x_admin_password: Optional[str] = Header(default=None),
 ) -> dict:
-    if not req.ticker.strip():
+    req.ticker = req.ticker.strip().upper()
+    if not req.ticker:
         raise HTTPException(status_code=400, detail="ticker is required")
     if not req.analysts:
         raise HTTPException(status_code=400, detail="select at least one analyst")
@@ -1271,6 +1288,8 @@ async def start_run(
     # RUN_LIMIT_PER_USER in a rolling RUN_LIMIT_WINDOW_HOURS window. Failed
     # runs are refunded (db.count_quota_consumed subtracts run_failed).
     owner = _is_owner(x_admin_password)
+    if not owner:
+        req = req.model_copy(update=dict.fromkeys(_OVERRIDE_FIELDS))
     quota = await loop.run_in_executor(None, _quota_state, client_meta, owner)
     if not quota["allowed"]:
         # 429 with a structured detail the UI can render verbatim.
@@ -1294,6 +1313,7 @@ async def start_run(
     nodes = _planned_nodes(req.analysts)
     run = manager.create(loop, nodes)
     run.analytics = client_meta  # carried into run_completed/run_failed events
+    run.owner = owner
     manager.emit(run, {"type": "nodes", "nodes": nodes})
 
     # Mark quota consumption. Counted against the user immediately so two
@@ -1328,15 +1348,16 @@ def get_chart(ticker: str, trade_date: str, asset_type: str = "stock", lookback:
     if not ticker.strip():
         raise HTTPException(status_code=400, detail="ticker is required")
     try:
-        return build_chart_payload(ticker, trade_date, lookback=lookback)
+        return build_chart_payload(ticker, trade_date, lookback=max(1, min(lookback, 3650)))
     except Exception as exc:  # noqa: BLE001 — surface as a clean 404 for the UI
-        raise HTTPException(status_code=404, detail=f"no chart data: {exc}")
+        logger.warning("chart failed for %s: %s", ticker, exc)
+        raise HTTPException(status_code=404, detail="no chart data")
 
 
 def _require_admin(password: Optional[str]) -> None:
     if not ADMIN_PASSWORD:
         raise HTTPException(status_code=503, detail="admin features are not configured")
-    if password != ADMIN_PASSWORD:
+    if not password or not hmac.compare_digest(password.encode(), ADMIN_PASSWORD.encode()):
         raise HTTPException(status_code=401, detail="invalid admin password")
 
 

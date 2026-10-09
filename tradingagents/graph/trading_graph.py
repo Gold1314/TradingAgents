@@ -48,6 +48,7 @@ from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
 from .signal_processing import SignalProcessor
+from . import jev_gate
 
 
 class TradingAgentsGraph:
@@ -398,6 +399,9 @@ class TradingAgentsGraph:
         # Store current state for reflection.
         self.curr_state = final_state
 
+        # Shadow-mode Jev probabilities (no-op without JEV_API_KEY); recorded, never acted on.
+        final_state["jev_assessment"] = jev_gate.assess(final_state)
+
         # Log state to disk.
         self._log_state(trade_date, final_state)
 
@@ -446,6 +450,7 @@ class TradingAgentsGraph:
             },
             "investment_plan": final_state["investment_plan"],
             "final_trade_decision": final_state["final_trade_decision"],
+            "jev_assessment": final_state.get("jev_assessment"),
         }
 
         # Save to file. Reject ticker values that would escape the

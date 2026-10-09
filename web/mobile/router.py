@@ -82,7 +82,8 @@ def build_mobile_router(server: ModuleType) -> APIRouter:
     async def create_run_v2(
         body: MobileRunRequest, request: Request, user: User = Depends(current_user)
     ) -> dict:
-        if not body.ticker.strip():
+        body.ticker = body.ticker.strip().upper()
+        if not body.ticker:
             raise HTTPException(status_code=400, detail="ticker is required")
         if not body.analysts:
             raise HTTPException(status_code=400, detail="select at least one analyst")
@@ -116,7 +117,7 @@ def build_mobile_router(server: ModuleType) -> APIRouter:
                 headers={"Retry-After": str(retry_after)},
             )
 
-        req = server.RunRequest(**body.model_dump())
+        req = server.RunRequest(**body.model_dump(exclude=set(server._OVERRIDE_FIELDS)))
         nodes = server._planned_nodes(req.analysts)
         run = server.manager.create(loop, nodes)
         # Record the owner (for per-user order authorization) and the ticker (so

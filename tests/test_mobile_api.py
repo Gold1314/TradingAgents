@@ -212,6 +212,9 @@ def _fake_server():
         _planned_nodes=lambda analysts: ["Market Analyst", "Portfolio Manager"],
         manager=FakeManager(),
         _run_pipeline=lambda run, req: None,  # never actually runs in tests
+        _OVERRIDE_FIELDS=("provider", "deep_model", "quick_model", "max_debate_rounds", "max_risk_rounds"),
+        db=types.SimpleNamespace(get_cache_enabled=lambda: False),
+        CACHE_WINDOW_MINUTES=60,
     )
 
 

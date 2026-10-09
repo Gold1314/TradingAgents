@@ -16,10 +16,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("tradingagents.web.db")
+
+# Values safe to embed in a PostgREST or_() filter: no commas, parens or quotes.
+_FILTER_SAFE = re.compile(r"[A-Za-z0-9:._-]{1,128}")
 
 CACHE_KEY = "cache_enabled"
 
@@ -220,8 +224,8 @@ def count_quota_consumed(
     storage / using incognito doesn't grant a fresh allowance to the same IP).
     Failed runs are refunded — only successful or in-flight runs consume quota.
 
-    Fail-open: returns 0 when Supabase is unavailable or the query errors, so a
-    transient DB issue can't lock everyone out.
+    Returns 0 when Supabase is not configured. Query errors propagate so the
+    caller can fail closed.
     """
     client = _get_client()
     if client is None:
@@ -240,9 +244,9 @@ def count_quota_consumed(
             # PostgREST OR: match either visitor or IP. Both fields are stored
             # by store_event(), so a single condition tree covers both.
             ors: List[str] = []
-            if visitor_id:
+            if visitor_id and _FILTER_SAFE.fullmatch(visitor_id):
                 ors.append(f"visitor_id.eq.{visitor_id}")
-            if ip_address:
+            if ip_address and _FILTER_SAFE.fullmatch(ip_address):
                 ors.append(f"ip_address.eq.{ip_address}")
             if ors:
                 q = q.or_(",".join(ors))
@@ -252,9 +256,9 @@ def count_quota_consumed(
         started = _count("run_started")
         failed = _count("run_failed")
         return max(started - failed, 0)
-    except Exception as exc:  # noqa: BLE001 — never lock users out on DB error
+    except Exception as exc:  # noqa: BLE001 — caller decides (server fails closed)
         logger.warning("count_quota_consumed failed: %s", exc)
-        return 0
+        raise
 
 
 def get_recent_run(

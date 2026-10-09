@@ -313,8 +313,10 @@ idempotent (a double-click can't fire twice). See `.env.example` for all vars.
 
 ### Web app usage
 
-1. Set the env vars above (at minimum `TRADINGAGENTS_ROBINHOOD_ENABLED=true`) and
-   start the web app.
+1. Set the env vars above (at minimum `TRADINGAGENTS_ROBINHOOD_ENABLED=true`) plus
+   `STOCKAGENTS_ADMIN_PASSWORD`, start the web app, and unlock admin with the ⚙
+   button. The Robinhood connect, account and order endpoints are operator-only,
+   and only runs started while unlocked are grounded on or trade your account.
 2. A **🪶 Robinhood** button appears in the header — click it to authorize via
    OAuth in your browser (tokens are cached at
    `~/.tradingagents/robinhood_token.json`, which is git-ignored).
